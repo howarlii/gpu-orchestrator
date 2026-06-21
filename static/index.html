@@ -1,0 +1,589 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPU Orchestrator</title>
+<link rel="stylesheet" href="/static/vendor/uPlot.min.css">
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2330; --border:#30363d;
+    --fg:#e6edf3; --dim:#8b949e; --green:#3fb950; --yellow:#d29922;
+    --red:#f85149; --blue:#58a6ff; --purple:#bc8cff; --mem:#db61a2;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:13px/1.4 ui-monospace,'SFMono-Regular',Menlo,Consolas,monospace}
+  a{color:var(--blue)}
+  .wrap{max-width:1600px;margin:0 auto;padding:12px}
+  h1{font-size:16px;margin:0 0 8px;display:flex;align-items:center;gap:10px}
+  .pill{font-size:11px;padding:1px 7px;border-radius:10px;border:1px solid var(--border)}
+  .pill.ok{color:var(--green)} .pill.bad{color:var(--red)}
+  .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+  @media(max-width:760px){.grid{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:10px}
+  .card.reserved{border-color:var(--yellow);box-shadow:0 0 0 1px var(--yellow) inset}
+  .ghead{display:flex;justify-content:space-between;align-items:baseline;gap:6px}
+  .gname{font-weight:600}
+  .gidx{color:var(--purple)}
+  .stats{display:flex;flex-wrap:wrap;gap:4px 12px;color:var(--dim);margin:6px 0;font-size:12px}
+  .stats b{color:var(--fg);font-weight:600}
+  .bar{height:6px;background:var(--panel2);border-radius:3px;overflow:hidden;margin-top:2px}
+  .bar>i{display:block;height:100%}
+  .charts{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:6px 0 2px}
+  .chart{min-width:0}
+  .chart .u-title{font-size:10px;color:var(--dim);padding:0;margin:0 0 1px}
+  .chart .uplot{width:100%}
+  .u-tip{position:absolute;pointer-events:none;z-index:10;background:#010409f2;
+    border:1px solid var(--border);border-radius:5px;padding:3px 7px;font-size:10px;
+    line-height:1.5;white-space:nowrap;color:var(--fg)}
+  .chart .u-wrap{margin-top:0}
+  table{width:100%;border-collapse:collapse;font-size:11.5px;margin-top:6px}
+  th,td{text-align:left;padding:4px 6px;border-bottom:1px solid var(--panel2);
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  th{color:var(--dim);font-weight:500;cursor:pointer;user-select:none}
+  .ptable td{color:var(--dim)} .ptable td b{color:var(--fg)}
+  td.args{padding:2px 6px;width:100%;max-width:0}
+  td.args>div{overflow-x:auto;white-space:nowrap;color:var(--dim);
+    font-size:11px;padding-bottom:2px}
+  td.args>div::-webkit-scrollbar{height:6px}
+  td.args>div::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+  td.nm{padding:2px 6px;width:100%}
+  td.nm>div{max-width:60vw;overflow-x:auto;white-space:nowrap;padding-bottom:2px}
+  td.nm>div::-webkit-scrollbar{height:6px}
+  td.nm>div::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+  .cmdtip{position:fixed;z-index:60;max-width:min(720px,80vw);background:var(--panel);
+    border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:11.5px;
+    color:var(--fg);white-space:pre-wrap;word-break:break-all;line-height:1.4;
+    box-shadow:0 8px 28px rgba(0,0,0,.45);pointer-events:none}
+  .controls{background:var(--panel);border:1px solid var(--border);border-radius:8px;
+    padding:10px;margin:12px 0}
+  .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+  .row+.row{margin-top:8px}
+  input,textarea,select,button{background:var(--panel2);color:var(--fg);
+    border:1px solid var(--border);border-radius:5px;padding:5px 8px;font:inherit}
+  textarea{width:100%;min-height:38px;resize:vertical}
+  input[type=number]{width:70px} input[type=checkbox]{accent-color:var(--blue)}
+  button{cursor:pointer} button:hover{border-color:var(--blue)}
+  button.primary{background:#1f6feb;border-color:#1f6feb;color:#fff}
+  button.danger{border-color:var(--red);color:var(--red)}
+  button.warn{border-color:var(--yellow);color:var(--yellow)}
+  button.sm{padding:2px 7px;font-size:11px}
+  button.tab{padding:3px 11px;font-size:11.5px;color:var(--dim)}
+  button.tab.on{background:var(--panel2);border-color:var(--blue);color:var(--fg);font-weight:600}
+  .label{color:var(--dim);font-size:11px}
+  .tasktable td,.tasktable th{font-size:11.5px;padding:3px 5px;white-space:nowrap}
+  .tasktable tbody tr{cursor:pointer;user-select:none}
+  .tasktable tbody tr:hover td{background:var(--panel2)}
+  .tasktable tbody tr.sel td{background:rgba(88,166,255,.16)}
+  .tasktable tbody tr.sel:hover td{background:rgba(88,166,255,.24)}
+  .tasktable tbody tr.sel td:first-child{box-shadow:inset 3px 0 0 var(--blue)}
+  .st{padding:0 6px;border-radius:8px;font-size:10.5px}
+  .st.running{background:rgba(63,185,80,.15);color:var(--green)}
+  .st.queued{background:rgba(88,166,255,.15);color:var(--blue)}
+  .st.done{background:rgba(139,148,158,.15);color:var(--dim)}
+  .st.failed,.st.lost{background:rgba(248,81,73,.15);color:var(--red)}
+  .st.killed{background:rgba(210,153,34,.15);color:var(--yellow)}
+  .modal{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;
+    align-items:center;justify-content:center;z-index:50}
+  .modal .box{background:var(--panel);border:1px solid var(--border);border-radius:8px;
+    width:min(900px,92vw);max-height:82vh;display:flex;flex-direction:column;padding:12px}
+  pre{background:#010409;border:1px solid var(--border);border-radius:6px;padding:10px;
+    overflow:auto;flex:1;white-space:pre-wrap;word-break:break-word;font-size:11.5px}
+  .muted{color:var(--dim)} .sp{flex:1}
+</style>
+</head>
+<body>
+<div class="wrap" x-data="app()" x-init="init()">
+  <h1>🖥️ GPU Orchestrator
+    <span class="pill" :class="connected?'ok':'bad'" x-text="connected?'live':'disconnected'"></span>
+    <span class="pill bad" x-show="monitorErr" x-text="monitorErr"></span>
+    <span class="sp"></span>
+    <button class="sm" @click="toggleCols()"
+      x-text="oneCol ? '▦ 2/row' : '▤ 1/row'"
+      title="toggle one / two GPU cards per row"></button>
+    <span class="label" x-text="'GPUs: '+gpus.length+'  ·  tasks: '+tasks.length"></span>
+  </h1>
+
+  <!-- GPU grid -->
+  <div class="grid" :style="oneCol ? 'grid-template-columns:1fr' : ''">
+    <template x-for="g in gpus" :key="g.index">
+      <div class="card" :class="{reserved: config.reserved_gpus.includes(g.index)}">
+        <div class="ghead">
+          <div><span class="gidx" x-text="'#'+g.index"></span>
+            <span class="gname" x-text="g.name"></span></div>
+          <div>
+            <button class="sm warn" @click="evacuate(g.index,true)"
+              title="kill+requeue all tasks here and reserve">evac</button>
+            <button class="sm" x-show="config.reserved_gpus.includes(g.index)"
+              @click="unreserve(g.index)" title="allow scheduling again">free</button>
+          </div>
+        </div>
+        <div class="stats">
+          <span>util <b style="color:var(--green)" x-text="fmtPct(g.util)"></b></span>
+          <span>mem <b style="color:var(--mem)" x-text="fmtGB(g.mem_used)+' / '+fmtGB(g.mem_total)"></b></span>
+          <span>PCIe <b style="color:var(--green)" x-text="'↑'+fmtBw(g.pcie_tx)"></b>
+            <b style="color:var(--blue)" x-text="'↓'+fmtBw(g.pcie_rx)"></b></span>
+          <span x-show="g.temp!=null">temp <b x-text="g.temp+'°'"></b></span>
+          <span x-show="g.power!=null">pwr <b x-text="Math.round(g.power)+'W'"></b></span>
+        </div>
+        <div class="bar"><i :style="`width:${g.util||0}%;background:var(--green)`"></i></div>
+        <div class="bar"><i :style="`width:${memPct(g)}%;background:var(--mem)`"></i></div>
+        <div class="charts">
+          <div class="chart" :id="'cu'+g.index"></div>
+          <div class="chart" :id="'cp'+g.index"></div>
+        </div>
+      </div>
+    </template>
+  </div>
+
+  <!-- Unified process table (nvitop-style) -->
+  <div class="controls">
+    <div class="row"><strong>Processes</strong>
+      <span class="label" x-text="allProcs().length+' on GPU'"></span></div>
+    <table class="ptable">
+      <thead><tr><th>GPU</th><th>PID</th><th>task</th><th>SM</th>
+        <th>GPU-mem</th><th>CPU</th><th>RAM</th><th>COMMAND</th></tr></thead>
+      <tbody>
+        <template x-for="p in allProcs()" :key="p.gpu+'-'+p.pid">
+          <tr>
+            <td><span class="gidx" x-text="'#'+p.gpu"></span></td>
+            <td x-text="p.pid"></td>
+            <td><b x-text="pidTask(p.pid)||'-'"></b></td>
+            <td x-text="p.sm!=null?p.sm+'%':'-'"></td>
+            <td x-text="fmtGB(p.gpu_mem)"></td>
+            <td x-text="p.cpu!=null?p.cpu+'%':'-'"></td>
+            <td x-text="fmtGB(p.rss)"></td>
+            <td class="args"><div x-text="p.cmd||''" :title="p.cmd"
+              @scroll="syncCmd($event)"></div></td>
+          </tr>
+        </template>
+        <tr x-show="!allProcs().length"><td colspan="8" class="muted">no GPU processes</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Controls -->
+  <div class="controls">
+    <div class="row">
+      <strong>Scheduler</strong>
+      <span class="label">max tasks/GPU</span>
+      <input type="number" min="1" x-model.number="config.max_tasks_per_gpu"
+        @change="saveConfig()">
+      <span class="label">min free HBM (GB)</span>
+      <input type="number" min="0" step="1" x-model.number="config.min_free_hbm_gb"
+        @change="saveConfig()">
+      <label><input type="checkbox" x-model="config.paused" @change="saveConfig()">
+        pause dispatch</label>
+      <span class="label">reserved: <span x-text="config.reserved_gpus.join(',')||'none'"></span></span>
+    </div>
+    <div class="row">
+      <strong>New task</strong>
+      <input placeholder="name (optional)" x-model="form.name" style="width:160px">
+      <span class="label">prio</span>
+      <input type="number" x-model.number="form.priority">
+      <span class="label">#gpu</span>
+      <input type="number" min="1" x-model.number="form.num_gpus">
+      <span class="label">min HBM</span>
+      <input type="number" min="0" placeholder="def" x-model="form.min_free_hbm_gb" style="width:60px">
+    </div>
+    <div class="row">
+      <textarea placeholder="shell command, e.g.  cd ~/dev/vllm-play && bash lihui/sweep.sh ..."
+        x-model="form.command" @keydown.ctrl.enter="addTask()"></textarea>
+    </div>
+    <div class="row">
+      <button class="primary" @click="addTask()">+ Enqueue (Ctrl+Enter)</button>
+      <label><input type="checkbox" x-model="form.perLine"> 每行一个任务</label>
+    </div>
+  </div>
+
+  <!-- Task table -->
+  <div class="controls">
+    <div class="row">
+      <strong>Queue</strong>
+      <button class="tab" :class="{on:queueTab==='active'}" @click="switchTab('active')"
+        x-text="'running+waiting ('+tabCount('active')+')'"></button>
+      <button class="tab" :class="{on:queueTab==='finished'}" @click="switchTab('finished')"
+        x-text="'finished ('+tabCount('finished')+')'"></button>
+      <button class="sm" @click="toggleSelectAll()"
+        x-text="allSelected()?'unselect all':'select all'"></button>
+      <span class="label" x-text="selected.length+' selected'"></span>
+      <span class="sp"></span>
+      <span class="label">set prio</span>
+      <input type="number" x-model.number="bulkPrio" style="width:60px">
+      <button class="sm" @click="bulkSetPrio()" :disabled="!selected.length">apply</button>
+      <button class="sm warn" @click="bulk('requeue')" :disabled="!selected.length">requeue</button>
+      <button class="sm danger" @click="bulk('delete')" :disabled="!selected.length">delete</button>
+    </div>
+    <table class="tasktable">
+      <thead><tr>
+        <th @click="sortBy('id')">id</th>
+        <th @click="sortBy('name')">name</th>
+        <th @click="sortBy('command')">command</th>
+        <th @click="sortBy('status')">status</th>
+        <th @click="sortBy('priority')">prio</th>
+        <th @click="sortBy('gpu_ids')">gpu</th>
+        <th @click="sortBy('runtime')">runtime</th>
+        <th>actions</th>
+      </tr></thead>
+      <tbody>
+        <template x-for="t in sortedTasks()" :key="t.id">
+          <tr :class="{sel:selected.includes(t.id)}" @click="rowClick(t,$event)">
+            <td x-text="t.id"></td>
+            <td class="nm"><div x-text="t.name" :title="t.name"></div></td>
+            <td><button class="sm" @click.stop="copyCmd(t)"
+              @mouseenter="showCmdTip($event,t.command)" @mousemove="moveCmdTip($event)"
+              @mouseleave="cmdTip=null"
+              x-text="copiedId===t.id?'✓ copied':'copy'"></button></td>
+            <td><span class="st" :class="t.status" x-text="t.status"></span></td>
+            <td x-text="t.priority"></td>
+            <td x-text="(JSON.parse(t.gpu_ids||'[]')).join(',')"></td>
+            <td x-text="runtime(t)"></td>
+            <td>
+              <button class="sm" @click.stop="showLog(t)">log</button>
+              <button class="sm warn" @click.stop="one('requeue',t.id)">↻</button>
+              <button class="sm danger" @click.stop="one('delete',t.id)">✕</button>
+            </td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Command hover tooltip -->
+  <div class="cmdtip" x-show="cmdTip" :style="cmdTipStyle()"
+    x-text="cmdTip?cmdTip.text:''" style="display:none"></div>
+
+  <!-- Log modal -->
+  <div class="modal" x-show="logTask" @click.self="logTask=null" style="display:none">
+    <div class="box">
+      <div class="row"><strong x-text="logTask?('task #'+logTask.id+'  '+logTask.name):''"></strong>
+        <span class="sp"></span>
+        <label><input type="checkbox" x-model="logFollow"> follow</label>
+        <button class="sm" @click="logTask=null">close</button></div>
+      <pre x-text="logText" x-ref="logpre"></pre>
+    </div>
+  </div>
+</div>
+
+<script src="/static/vendor/uPlot.iife.min.js"></script>
+<script src="/static/vendor/alpine.min.js" defer></script>
+<script>
+const HLEN = 600;
+const charts = {};   // index -> {util, pcie}
+const buf = {};      // index -> {x, util, mem, tx, rx}
+
+function tooltipPlugin(fmt){
+  let tip;
+  return {hooks:{
+    init(u){
+      tip=document.createElement('div');
+      tip.className='u-tip';
+      tip.style.display='none';
+      u.over.appendChild(tip);
+      u.over.addEventListener('mouseleave',()=>tip.style.display='none');
+    },
+    setCursor(u){
+      const {left,top,idx}=u.cursor;
+      const xs=u.data[0];
+      if(idx==null||left<0||top<0||!xs||!xs.length){tip.style.display='none';return;}
+      const d=new Date(xs[idx]*1000);
+      const hh=('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)
+              +':'+('0'+d.getSeconds()).slice(-2);
+      let html='<b>'+hh+'</b>';
+      for(let s=1;s<u.series.length;s++){
+        const ser=u.series[s], v=u.data[s][idx];
+        const col=typeof ser.stroke==='function'?ser.stroke(u,s):ser.stroke;
+        html+='<br><span style="color:'+col+'">■</span> '+ser.label+' '
+             +(v==null?'-':fmt(Math.round(v*100)/100));
+      }
+      tip.innerHTML=html;
+      tip.style.display='block';
+      const flip=left>u.over.clientWidth*0.6;
+      tip.style.left=(left+(flip?-10:10))+'px';
+      tip.style.top=top+'px';
+      tip.style.transform='translate('+(flip?'-100%':'0')+',-50%)';
+    }
+  }};
+}
+
+function chartOpts(title, series, fmt, yrange){
+  return {
+    width: 180, height: 138, title,
+    padding:[6,8,0,2],
+    cursor:{x:true, y:false}, legend:{show:false},
+    plugins:[tooltipPlugin(fmt)],
+    scales:{x:{time:true}, y: yrange ? {range: yrange} : {}},
+    axes:[
+      {stroke:'#8b949e', grid:{stroke:'#21262d'}, size:26, gap:2,
+       values:(u,v)=>v.map(t=>{const d=new Date(t*1000);
+         return ('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)})},
+      {stroke:'#8b949e', grid:{stroke:'#21262d'}, size:46, gap:4,
+       values:(u,v)=>v.map(fmt)}
+    ],
+    series
+  };
+}
+
+function makeCharts(gpus){
+  gpus.forEach(g=>{
+    const i=g.index;
+    if(charts[i]) return;
+    const eu=document.getElementById('cu'+i);
+    const ep=document.getElementById('cp'+i);
+    if(!eu||!ep) return;
+    buf[i]=buf[i]||{x:[],util:[],mem:[],tx:[],rx:[]};
+    charts[i]={
+      util:new uPlot(chartOpts('util % / mem %',[
+        {},
+        {label:'util',stroke:'#3fb950',width:1.5,fill:'rgba(63,185,80,.12)'},
+        {label:'mem',stroke:'#db61a2',width:1.5}
+      ],v=>v+'%',[0,100]),[[],[],[]],eu),
+      pcie:new uPlot(chartOpts('PCIe GB/s',[
+        {},
+        {label:'tx',stroke:'#3fb950',width:1.5},
+        {label:'rx',stroke:'#58a6ff',width:1.5}
+      ],v=>(+v).toFixed(1),
+      (u,dmin,dmax)=>[0,Math.max(0.1,(dmax||0)*1.05)]),[[],[],[]],ep)
+    };
+    const ut=eu.querySelector('.u-title'), pt=ep.querySelector('.u-title');
+    if(ut) ut.innerHTML='<span style="color:#3fb950">■</span>util'
+      +' <span style="color:#db61a2">■</span>mem  (%)';
+    if(pt) pt.innerHTML='<span style="color:#3fb950">■</span>tx'
+      +' <span style="color:#58a6ff">■</span>rx  (GB/s)';
+    sizeChart(i);
+  });
+}
+
+function sizeChart(i){
+  const eu=document.getElementById('cu'+i), ep=document.getElementById('cp'+i);
+  if(charts[i]&&eu&&ep){
+    charts[i].util.setSize({width:eu.clientWidth,height:138});
+    charts[i].pcie.setSize({width:ep.clientWidth,height:138});
+  }
+}
+window.addEventListener('resize',()=>Object.keys(charts).forEach(i=>sizeChart(i)));
+
+function pushHistory(i,row){
+  // row = [ts, util, mem_used, tx, rx]
+  const b=buf[i]; if(!b) return;
+  const total=(window._memtotal&&window._memtotal[i])||1;
+  b.x.push(row[0]);
+  b.util.push(row[1]);
+  b.mem.push(row[2]==null?null:row[2]/total*100);
+  b.tx.push(row[3]==null?null:row[3]/1e9);
+  b.rx.push(row[4]==null?null:row[4]/1e9);
+  if(b.x.length>HLEN){['x','util','mem','tx','rx'].forEach(k=>b[k].shift());}
+}
+function redraw(i){
+  const b=buf[i]; if(!b||!charts[i]) return;
+  charts[i].util.setData([b.x,b.util,b.mem]);
+  charts[i].pcie.setData([b.x,b.tx,b.rx]);
+}
+
+function app(){
+  return {
+    connected:false, monitorErr:'',
+    gpus:[], tasks:[], config:{reserved_gpus:[],max_tasks_per_gpu:1,min_free_hbm_gb:10,paused:false},
+    form:{command:'',name:'',priority:0,num_gpus:1,min_free_hbm_gb:'',perLine:false},
+    selected:[], bulkPrio:0, queueTab:'active', cmdTip:null, copiedId:null, anchorId:null,
+    sortKey:'id', sortDir:1,
+    logTask:null, logText:'', logFollow:true, _logTimer:null,
+    _pidmap:{},
+    oneCol: localStorage.getItem('oneCol')==='1',
+
+    init(){ this.connect(); },
+    _resizeCharts(){ requestAnimationFrame(()=>
+      Object.keys(charts).forEach(i=>sizeChart(i))); },
+    toggleCols(){
+      this.oneCol=!this.oneCol;
+      localStorage.setItem('oneCol', this.oneCol?'1':'0');
+      this._resizeCharts();
+    },
+    connect(){
+      const ws=new WebSocket(`ws://${location.host}/ws`);
+      this.ws=ws;
+      ws.onopen=()=>{this.connected=true;};
+      ws.onclose=()=>{this.connected=false;setTimeout(()=>this.connect(),1500);};
+      ws.onmessage=(e)=>this.onMsg(JSON.parse(e.data));
+    },
+    onMsg(m){
+      if(m.type==='snapshot'){
+        this.monitorErr = m.monitor_ok?'':(m.monitor_err||'NVML unavailable');
+        window._memtotal={};
+        (m.static||[]).forEach(s=>window._memtotal[s.index]=s.mem_total);
+        this.config=m.config; this.tasks=m.tasks;
+        this.gpus=m.sample.gpus||[];
+        this.$nextTick(()=>{
+          makeCharts(this.gpus);
+          Object.entries(m.history||{}).forEach(([i,rows])=>{
+            buf[i]=buf[i]||{x:[],util:[],mem:[],tx:[],rx:[]};
+            buf[i]={x:[],util:[],mem:[],tx:[],rx:[]};
+            rows.forEach(r=>pushHistory(i,r));
+            redraw(i);
+          });
+        });
+      } else if(m.type==='tick'){
+        this.gpus=m.sample.gpus||[];
+        this.tasks=m.tasks;
+        this.buildPidMap();
+        this.$nextTick(()=>{
+          makeCharts(this.gpus);
+          this.gpus.forEach(g=>{
+            pushHistory(g.index,[m.sample.ts,g.util,g.mem_used,g.pcie_tx,g.pcie_rx]);
+            redraw(g.index);
+          });
+        });
+      }
+    },
+    buildPidMap(){
+      const map={};
+      this.tasks.forEach(t=>{ if(t.pid) map[t.pid]=t.name||('#'+t.id); });
+      this._pidmap=map;
+    },
+    pidTask(pid){ return this._pidmap[pid]||''; },
+    allProcs(){
+      const out=[];
+      this.gpus.forEach(g=>(g.procs||[]).forEach(p=>out.push({...p,gpu:g.index})));
+      return out.sort((a,b)=>a.gpu-b.gpu || (b.gpu_mem||0)-(a.gpu_mem||0));
+    },
+    syncCmd(e){
+      const x=e.target.scrollLeft;
+      if(this._cmdX===x)return; this._cmdX=x;
+      document.querySelectorAll('td.args>div').forEach(d=>{
+        if(d!==e.target && d.scrollLeft!==x) d.scrollLeft=x;
+      });
+    },
+
+    // formatting
+    fmtPct(v){ return v==null?'-':v+'%'; },
+    fmtGB(b){ return b==null?'-':(b/1e9).toFixed(1)+'G'; },
+    fmtBw(b){ return b==null?'-':(b/1e9).toFixed(1)+'G/s'; },
+    memPct(g){ return g.mem_total?Math.round((g.mem_used||0)/g.mem_total*100):0; },
+
+    // tasks
+    async api(url,method='POST',body=null){
+      const r=await fetch(url,{method,headers:{'Content-Type':'application/json'},
+        body:body?JSON.stringify(body):null});
+      const d=await r.json(); if(d.tasks)this.tasks=d.tasks;
+      if(d.config)this.config=d.config; return d;
+    },
+    async addTask(){
+      const f=this.form;
+      if(!f.command.trim())return;
+      let cmds=[f.command.trim()];
+      if(f.perLine){
+        cmds=f.command.split('\n').map(s=>s.trim())
+             .filter(s=>s && !s.startsWith('#'));
+      }
+      for(const c of cmds){
+        await this.api('/api/tasks','POST',{command:c,name:f.name,
+          priority:f.priority||0,num_gpus:f.num_gpus||1,
+          min_free_hbm_gb:f.min_free_hbm_gb===''?null:Number(f.min_free_hbm_gb)});
+      }
+      this.form.command='';this.form.name='';
+    },
+    one(action,id){ this.dispatch(action,[id]); },
+    bulk(action){ if(this.selected.length)this.dispatch(action,[...this.selected]); },
+    async dispatch(action,ids){
+      if(action==='delete'){ if(!confirm('delete '+ids.length+' task(s)?'))return;
+        await this.api('/api/tasks','DELETE',{ids}); }
+      else if(action==='requeue'){ await this.api('/api/tasks/requeue','POST',{ids}); }
+      this.selected=this.selected.filter(x=>!ids.includes(x));
+    },
+    async bulkSetPrio(){ await this.api('/api/tasks/update','POST',
+      {ids:[...this.selected],priority:this.bulkPrio}); },
+    // row selection: click toggles, shift-click selects a contiguous range
+    rowClick(t,e){
+      const list=this.sortedTasks();
+      if(e.shiftKey && this.anchorId!=null){
+        const a=list.findIndex(x=>x.id===this.anchorId);
+        const b=list.findIndex(x=>x.id===t.id);
+        if(a>=0 && b>=0){
+          const [lo,hi]=a<b?[a,b]:[b,a];
+          const set=new Set(this.selected);
+          for(let i=lo;i<=hi;i++)set.add(list[i].id);
+          this.selected=[...set];
+          return;
+        }
+      }
+      this.selected=this.selected.includes(t.id)
+        ? this.selected.filter(id=>id!==t.id)
+        : [...this.selected,t.id];
+      this.anchorId=t.id;
+    },
+    allSelected(){ const v=this.sortedTasks();
+      return v.length>0 && v.every(t=>this.selected.includes(t.id)); },
+    toggleSelectAll(){ this.selected=this.allSelected()
+      ? [] : this.sortedTasks().map(t=>t.id); },
+
+    // config
+    async saveConfig(){ await this.api('/api/config','POST',{
+      max_tasks_per_gpu:this.config.max_tasks_per_gpu,
+      min_free_hbm_gb:this.config.min_free_hbm_gb,
+      paused:this.config.paused}); },
+    async evacuate(gpu){ if(!confirm('evacuate GPU '+gpu+'? kills+requeues its tasks'))return;
+      await this.api('/api/evacuate','POST',{gpu,reserve:true}); },
+    async unreserve(gpu){ const r=this.config.reserved_gpus.filter(x=>x!==gpu);
+      await this.api('/api/config','POST',{reserved_gpus:r}); },
+
+    // sorting
+    sortBy(k){ if(this.sortKey===k)this.sortDir*=-1; else{this.sortKey=k;this.sortDir=1;} },
+    switchTab(tab){ if(this.queueTab===tab)return; this.queueTab=tab; this.selected=[];
+      // default ordering per tab: finished → most recently ended first
+      if(tab==='finished'){ this.sortKey='ended_at'; this.sortDir=-1; }
+      else { this.sortKey='id'; this.sortDir=1; } },
+    // command copy + hover tooltip
+    showCmdTip(e,text){ this.cmdTip={text,x:e.clientX,y:e.clientY}; },
+    moveCmdTip(e){ if(this.cmdTip){ this.cmdTip.x=e.clientX; this.cmdTip.y=e.clientY; } },
+    cmdTipStyle(){ if(!this.cmdTip)return '';
+      const x=Math.min(this.cmdTip.x+14, window.innerWidth-360);
+      const y=Math.min(this.cmdTip.y+16, window.innerHeight-80);
+      return `left:${Math.max(8,x)}px;top:${Math.max(8,y)}px`; },
+    async copyCmd(t){
+      const txt=t.command||'';
+      try{ await navigator.clipboard.writeText(txt); }
+      catch(_){ const ta=document.createElement('textarea'); ta.value=txt;
+        ta.style.position='fixed'; ta.style.opacity='0'; document.body.appendChild(ta);
+        ta.select(); try{document.execCommand('copy');}catch(__){} ta.remove(); }
+      this.copiedId=t.id;
+      setTimeout(()=>{ if(this.copiedId===t.id)this.copiedId=null; },1200);
+    },
+    isActive(t){ return t.status==='running'||t.status==='queued'; },
+    inTab(t){ return this.queueTab==='active' ? this.isActive(t) : !this.isActive(t); },
+    tabCount(tab){ return this.tasks.filter(t=>
+      (tab==='active')===this.isActive(t)).length; },
+    sortedTasks(){
+      const k=this.sortKey,d=this.sortDir;
+      const val=(t)=>{
+        if(k==='runtime')return this._rt(t);
+        if(k==='command'||k==='name'||k==='status')return (t[k]||'').toLowerCase();
+        if(k==='gpu_ids')return t.gpu_ids||'';
+        return t[k]??0;
+      };
+      return this.tasks.filter(t=>this.inTab(t)).sort((a,b)=>{
+        const x=val(a),y=val(b);
+        if(x<y)return -1*d; if(x>y)return 1*d; return (a.id-b.id)*d;
+      });
+    },
+    _rt(t){ if(!t.started_at)return 0;
+      return (t.ended_at||Date.now()/1000)-t.started_at; },
+    runtime(t){ const s=this._rt(t); if(!s)return '-';
+      const m=Math.floor(s/60),sec=Math.floor(s%60);
+      return m>=60?Math.floor(m/60)+'h'+(m%60)+'m':m+'m'+sec+'s'; },
+
+    // log
+    async showLog(t){ this.logTask=t; this.logText='loading…'; await this.refreshLog();
+      clearInterval(this._logTimer);
+      this._logTimer=setInterval(()=>{ if(this.logTask&&this.logFollow)this.refreshLog(); },2000);
+    },
+    async refreshLog(){ if(!this.logTask)return;
+      const r=await fetch('/api/tasks/'+this.logTask.id+'/log?tail=400');
+      const d=await r.json(); this.logText=d.log||'(empty)';
+      this.$nextTick(()=>{const p=this.$refs.logpre; if(p&&this.logFollow)p.scrollTop=p.scrollHeight;});
+    },
+  };
+}
+</script>
+</body>
+</html>

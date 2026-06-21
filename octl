@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Thin wrapper so `octl ...` works from anywhere. Uses the orchestrator venv
+# python (octl.py is stdlib-only, so any python3 also works).
+DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PY="$DIR/.venv/bin/python"; [[ -x "$PY" ]] || PY=python3
+exec "$PY" "$DIR/octl.py" "$@"
