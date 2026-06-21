@@ -30,6 +30,11 @@
   .stats b{color:var(--fg);font-weight:600}
   .bar{height:6px;background:var(--panel2);border-radius:3px;overflow:hidden;margin-top:2px}
   .bar>i{display:block;height:100%}
+  .sysbar{display:flex;flex-wrap:wrap;align-items:center;gap:6px 24px;
+    margin-top:10px;padding:7px 14px}
+  .sysitem{display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--dim)}
+  .sysitem b{color:var(--fg);font-weight:600}
+  .sysitem .bar.wide{width:150px;height:8px;margin-top:0}
   .charts{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:6px 0 2px}
   .chart{min-width:0}
   .chart .u-title{font-size:10px;color:var(--dim);padding:0;margin:0 0 1px}
@@ -91,6 +96,9 @@
   pre{background:#010409;border:1px solid var(--border);border-radius:6px;padding:10px;
     overflow:auto;flex:1;white-space:pre-wrap;word-break:break-word;font-size:11.5px}
   .muted{color:var(--dim)} .sp{flex:1}
+  [x-cloak]{display:none!important}
+  .foldhead{cursor:pointer;user-select:none}
+  .foldhead strong:hover{color:var(--blue)}
 </style>
 </head>
 <body>
@@ -137,19 +145,35 @@
     </template>
   </div>
 
+  <!-- Host (CPU / RAM / disk / net) — compact single row -->
+  <div class="card sysbar">
+    <div class="sysitem"><span class="label">CPU</span>
+      <div class="bar wide"><i :style="`width:${Math.min(100,sys.cpu||0)}%;background:var(--green)`"></i></div>
+      <b style="min-width:34px;text-align:right" x-text="sys.cpu==null?'-':Math.round(sys.cpu)+'%'"></b></div>
+    <div class="sysitem"><span class="label">RAM</span>
+      <div class="bar wide"><i :style="`width:${ramPct()}%;background:var(--mem)`"></i></div>
+      <b x-text="fmtGiB(sys.ram_used)+' / '+fmtGiB(sys.ram_total)"></b></div>
+    <div class="sysitem"><span class="label">DISK</span>
+      <b style="color:var(--green)" x-text="'R '+fmtRate(sys.disk_r)"></b>
+      <b style="color:var(--blue)" x-text="'W '+fmtRate(sys.disk_w)"></b></div>
+    <div class="sysitem"><span class="label">NET</span>
+      <b style="color:var(--green)" x-text="'↑'+fmtRate(sys.net_u)"></b>
+      <b style="color:var(--blue)" x-text="'↓'+fmtRate(sys.net_d)"></b></div>
+  </div>
+
   <!-- Unified process table (nvitop-style) -->
   <div class="controls">
     <div class="row"><strong>Processes</strong>
       <span class="label" x-text="allProcs().length+' on GPU'"></span></div>
     <table class="ptable">
-      <thead><tr><th>GPU</th><th>PID</th><th>task</th><th>SM</th>
+      <thead><tr><th>GPU</th><th>PID</th><th>user</th><th>SM</th>
         <th>GPU-mem</th><th>CPU</th><th>RAM</th><th>COMMAND</th></tr></thead>
       <tbody>
         <template x-for="p in allProcs()" :key="p.gpu+'-'+p.pid">
           <tr>
             <td><span class="gidx" x-text="'#'+p.gpu"></span></td>
             <td x-text="p.pid"></td>
-            <td><b x-text="pidTask(p.pid)||'-'"></b></td>
+            <td><b x-text="p.user||'-'"></b></td>
             <td x-text="p.sm!=null?p.sm+'%':'-'"></td>
             <td x-text="fmtGB(p.gpu_mem)"></td>
             <td x-text="p.cpu!=null?p.cpu+'%':'-'"></td>
@@ -173,27 +197,38 @@
       <span class="label">min free HBM (GB)</span>
       <input type="number" min="0" step="1" x-model.number="config.min_free_hbm_gb"
         @change="saveConfig()">
+      <span class="label" title="只有空闲 RAM 高于此值才继续分配 (0=关闭)">min free RAM (GB)</span>
+      <input type="number" min="0" step="1" x-model.number="config.min_free_ram_gb"
+        @change="saveConfig()">
+      <span class="label" title="同时运行的任务总数上限 (0=不限)">max concurrent</span>
+      <input type="number" min="0" step="1" x-model.number="config.max_concurrent_tasks"
+        @change="saveConfig()">
       <label><input type="checkbox" x-model="config.paused" @change="saveConfig()">
         pause dispatch</label>
       <span class="label">reserved: <span x-text="config.reserved_gpus.join(',')||'none'"></span></span>
     </div>
-    <div class="row">
-      <strong>New task</strong>
-      <input placeholder="name (optional)" x-model="form.name" style="width:160px">
-      <span class="label">prio</span>
-      <input type="number" x-model.number="form.priority">
-      <span class="label">#gpu</span>
-      <input type="number" min="1" x-model.number="form.num_gpus">
-      <span class="label">min HBM</span>
-      <input type="number" min="0" placeholder="def" x-model="form.min_free_hbm_gb" style="width:60px">
+    <div class="row foldhead" @click="toggleNewTask()">
+      <strong x-text="(showNewTask?'▾':'▸')+' New task'"></strong>
+      <span class="label" x-show="!showNewTask">点击展开新建任务</span>
     </div>
-    <div class="row">
-      <textarea placeholder="shell command, e.g.  cd ~/dev/vllm-play && bash lihui/sweep.sh ..."
-        x-model="form.command" @keydown.ctrl.enter="addTask()"></textarea>
-    </div>
-    <div class="row">
-      <button class="primary" @click="addTask()">+ Enqueue (Ctrl+Enter)</button>
-      <label><input type="checkbox" x-model="form.perLine"> 每行一个任务</label>
+    <div x-show="showNewTask" x-cloak>
+      <div class="row">
+        <input placeholder="name (optional)" x-model="form.name" style="width:160px">
+        <span class="label">prio</span>
+        <input type="number" x-model.number="form.priority">
+        <span class="label">#gpu</span>
+        <input type="number" min="1" x-model.number="form.num_gpus">
+        <span class="label">min HBM</span>
+        <input type="number" min="0" placeholder="def" x-model="form.min_free_hbm_gb" style="width:60px">
+      </div>
+      <div class="row">
+        <textarea placeholder="shell command, e.g.  cd ~/dev/vllm-play && bash lihui/sweep.sh ..."
+          x-model="form.command" @keydown.ctrl.enter="addTask()"></textarea>
+      </div>
+      <div class="row">
+        <button class="primary" @click="addTask()">+ Enqueue (Ctrl+Enter)</button>
+        <label><input type="checkbox" x-model="form.perLine"> 每行一个任务</label>
+      </div>
     </div>
   </div>
 
@@ -202,12 +237,20 @@
     <div class="row">
       <strong>Queue</strong>
       <button class="tab" :class="{on:queueTab==='active'}" @click="switchTab('active')"
-        x-text="'running+waiting ('+tabCount('active')+')'"></button>
+        title="running / waiting"
+        x-text="'running+waiting ('+runningCount()+'/'+waitingCount()+')'"></button>
       <button class="tab" :class="{on:queueTab==='finished'}" @click="switchTab('finished')"
         x-text="'finished ('+tabCount('finished')+')'"></button>
+      <input placeholder="🔍 filter id / name / cmd / status" x-model="filter"
+        @keydown.escape="filter=''" style="width:230px">
+      <button class="sm" x-show="filter" @click="filter=''" title="clear filter">✕</button>
       <button class="sm" @click="toggleSelectAll()"
         x-text="allSelected()?'unselect all':'select all'"></button>
       <span class="label" x-text="selected.length+' selected'"></span>
+      <span class="label" x-show="filter" x-text="sortedTasks().length+' match'"></span>
+      <button class="sm warn" x-show="queueTab==='finished'" :disabled="!failedCount()"
+        @click="retryFailed()"
+        x-text="'↻ retry all failed ('+failedCount()+')'"></button>
       <span class="sp"></span>
       <span class="label">set prio</span>
       <input type="number" x-model.number="bulkPrio" style="width:60px">
@@ -235,7 +278,22 @@
               @mouseenter="showCmdTip($event,t.command)" @mousemove="moveCmdTip($event)"
               @mouseleave="cmdTip=null"
               x-text="copiedId===t.id?'✓ copied':'copy'"></button></td>
-            <td><span class="st" :class="t.status" x-text="t.status"></span></td>
+            <td>
+              <template x-if="t.status==='lost' && statusEdit===t.id">
+                <span class="row" style="gap:4px">
+                  <button class="sm" @click.stop="setStatus(t,'done')">done</button>
+                  <button class="sm danger" @click.stop="setStatus(t,'failed')">failed</button>
+                  <button class="sm" @click.stop="statusEdit=null">✕</button>
+                </span>
+              </template>
+              <template x-if="!(t.status==='lost' && statusEdit===t.id)">
+                <span class="st" :class="t.status"
+                  :style="t.status==='lost'?'cursor:pointer':''"
+                  :title="t.status==='lost'?'click to mark done / failed':''"
+                  @click.stop="t.status==='lost' && (statusEdit=t.id)"
+                  x-text="t.status==='lost'?'lost ▾':t.status"></span>
+              </template>
+            </td>
             <td x-text="t.priority"></td>
             <td x-text="(JSON.parse(t.gpu_ids||'[]')).join(',')"></td>
             <td x-text="runtime(t)"></td>
@@ -384,15 +442,21 @@ function redraw(i){
 function app(){
   return {
     connected:false, monitorErr:'',
-    gpus:[], tasks:[], config:{reserved_gpus:[],max_tasks_per_gpu:1,min_free_hbm_gb:10,paused:false},
+    gpus:[], tasks:[], sys:{},
+    config:{reserved_gpus:[],max_tasks_per_gpu:1,min_free_hbm_gb:10,
+      min_free_ram_gb:0,max_concurrent_tasks:0,paused:false},
     form:{command:'',name:'',priority:0,num_gpus:1,min_free_hbm_gb:'',perLine:false},
-    selected:[], bulkPrio:0, queueTab:'active', cmdTip:null, copiedId:null, anchorId:null,
+    selected:[], bulkPrio:0, queueTab:'active', filter:'', statusEdit:null,
+    cmdTip:null, copiedId:null, anchorId:null,
     sortKey:'id', sortDir:1,
     logTask:null, logText:'', logFollow:true, _logTimer:null,
     _pidmap:{},
     oneCol: localStorage.getItem('oneCol')==='1',
+    showNewTask: localStorage.getItem('showNewTask')==='1',
 
     init(){ this.connect(); },
+    toggleNewTask(){ this.showNewTask=!this.showNewTask;
+      localStorage.setItem('showNewTask', this.showNewTask?'1':'0'); },
     _resizeCharts(){ requestAnimationFrame(()=>
       Object.keys(charts).forEach(i=>sizeChart(i))); },
     toggleCols(){
@@ -414,6 +478,7 @@ function app(){
         (m.static||[]).forEach(s=>window._memtotal[s.index]=s.mem_total);
         this.config=m.config; this.tasks=m.tasks;
         this.gpus=m.sample.gpus||[];
+        this.sys=m.sample.sys||{};
         this.$nextTick(()=>{
           makeCharts(this.gpus);
           Object.entries(m.history||{}).forEach(([i,rows])=>{
@@ -425,6 +490,7 @@ function app(){
         });
       } else if(m.type==='tick'){
         this.gpus=m.sample.gpus||[];
+        this.sys=m.sample.sys||{};
         this.tasks=m.tasks;
         this.buildPidMap();
         this.$nextTick(()=>{
@@ -457,9 +523,17 @@ function app(){
 
     // formatting
     fmtPct(v){ return v==null?'-':v+'%'; },
-    fmtGB(b){ return b==null?'-':(b/1e9).toFixed(1)+'G'; },
+    // GPU HBM / RAM are reported in bytes; show GiB (base-2) to match nvidia-smi
+    fmtGB(b){ return b==null?'-':(b/1073741824).toFixed(1)+'G'; },
     fmtBw(b){ return b==null?'-':(b/1e9).toFixed(1)+'G/s'; },
+    fmtGiB(b){ return this.fmtGB(b); },
+    fmtRate(b){ if(b==null)return '-';
+      const u=['B','K','M','G']; let i=0,v=b;
+      while(v>=1024&&i<3){v/=1024;i++;}
+      return (i===0?Math.round(v):v.toFixed(v<10?1:0))+u[i]+'/s'; },
     memPct(g){ return g.mem_total?Math.round((g.mem_used||0)/g.mem_total*100):0; },
+    ramPct(){ return this.sys.ram_total
+      ?Math.round((this.sys.ram_used||0)/this.sys.ram_total*100):0; },
 
     // tasks
     async api(url,method='POST',body=null){
@@ -493,6 +567,13 @@ function app(){
     },
     async bulkSetPrio(){ await this.api('/api/tasks/update','POST',
       {ids:[...this.selected],priority:this.bulkPrio}); },
+    failedCount(){ return this.tasks.filter(t=>
+      t.status==='failed'||t.status==='lost').length; },
+    async retryFailed(){ const n=this.failedCount(); if(!n)return;
+      if(!confirm('retry '+n+' failed/lost task(s)?'))return;
+      await this.api('/api/tasks/retry_failed','POST',{}); },
+    async setStatus(t,status){ this.statusEdit=null;
+      await this.api('/api/tasks/set_status','POST',{ids:[t.id],status}); },
     // row selection: click toggles, shift-click selects a contiguous range
     rowClick(t,e){
       const list=this.sortedTasks();
@@ -521,6 +602,8 @@ function app(){
     async saveConfig(){ await this.api('/api/config','POST',{
       max_tasks_per_gpu:this.config.max_tasks_per_gpu,
       min_free_hbm_gb:this.config.min_free_hbm_gb,
+      min_free_ram_gb:this.config.min_free_ram_gb,
+      max_concurrent_tasks:this.config.max_concurrent_tasks,
       paused:this.config.paused}); },
     async evacuate(gpu){ if(!confirm('evacuate GPU '+gpu+'? kills+requeues its tasks'))return;
       await this.api('/api/evacuate','POST',{gpu,reserve:true}); },
@@ -553,6 +636,16 @@ function app(){
     inTab(t){ return this.queueTab==='active' ? this.isActive(t) : !this.isActive(t); },
     tabCount(tab){ return this.tasks.filter(t=>
       (tab==='active')===this.isActive(t)).length; },
+    runningCount(){ return this.tasks.filter(t=>t.status==='running').length; },
+    waitingCount(){ return this.tasks.filter(t=>t.status==='queued').length; },
+    matchFilter(t){
+      const q=(this.filter||'').trim().toLowerCase();
+      if(!q)return true;
+      // every space-separated term must match somewhere (AND)
+      const hay=(String(t.id)+' '+(t.name||'')+' '+(t.command||'')+' '
+        +(t.status||'')).toLowerCase();
+      return q.split(/\s+/).every(term=>hay.includes(term));
+    },
     sortedTasks(){
       const k=this.sortKey,d=this.sortDir;
       const val=(t)=>{
@@ -561,7 +654,7 @@ function app(){
         if(k==='gpu_ids')return t.gpu_ids||'';
         return t[k]??0;
       };
-      return this.tasks.filter(t=>this.inTab(t)).sort((a,b)=>{
+      return this.tasks.filter(t=>this.inTab(t)&&this.matchFilter(t)).sort((a,b)=>{
         const x=val(a),y=val(b);
         if(x<y)return -1*d; if(x>y)return 1*d; return (a.id-b.id)*d;
       });

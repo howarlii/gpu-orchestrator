@@ -19,6 +19,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import psutil
+
 ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "orchestrator.db"
 LOG_DIR = ROOT / "logs"
@@ -36,6 +38,9 @@ class Scheduler:
         self.monitor = monitor
         self.lock = threading.RLock()
         self.procs: dict[int, subprocess.Popen] = {}  # task_id -> Popen
+        # tasks re-adopted after a restart: task_id -> pid (not our children,
+        # so they can only be polled by PID existence, not waitpid()'d)
+        self.orphans: dict[int, int] = {}
         self.db = sqlite3.connect(DB_PATH, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self._init_db()
@@ -70,6 +75,8 @@ class Scheduler:
             defaults = {
                 "max_tasks_per_gpu": "1",
                 "min_free_hbm_gb": "10",
+                "min_free_ram_gb": "0",       # 0 = no RAM gate
+                "max_concurrent_tasks": "0",  # 0 = unlimited
                 "reserved_gpus": "[]",
                 "paused": "0",
             }
@@ -79,11 +86,36 @@ class Scheduler:
             self.db.commit()
 
     def _recover(self) -> None:
+        """On restart, re-adopt still-running detached processes by PID.
+
+        Children were launched with setsid(), so they survive this process'
+        death. We can't waitpid() a non-child, so we poll PID existence in
+        reap(). Tasks whose process is gone are marked 'lost'.
+        """
         with self.lock:
-            self.db.execute(
-                "UPDATE tasks SET status='lost', ended_at=? "
-                "WHERE status='running'", (_now(),))
+            rows = self.db.execute(
+                "SELECT id, pid, started_at FROM tasks "
+                "WHERE status='running'").fetchall()
+            for r in rows:
+                if r["pid"] and self._pid_alive(r["pid"], r["started_at"]):
+                    self.orphans[r["id"]] = r["pid"]
+                else:
+                    self.db.execute(
+                        "UPDATE tasks SET status='lost', ended_at=? WHERE id=?",
+                        (_now(), r["id"]))
             self.db.commit()
+
+    @staticmethod
+    def _pid_alive(pid: int, started_at: Optional[float]) -> bool:
+        """True if pid exists and (when known) started before the task did,
+        guarding against PID reuse by an unrelated process."""
+        try:
+            p = psutil.Process(pid)
+            if started_at and p.create_time() > started_at + 5:
+                return False
+            return p.is_running() and p.status() != psutil.STATUS_ZOMBIE
+        except Exception:
+            return False
 
     # ---- config -------------------------------------------------------------
     def get_config(self) -> dict:
@@ -93,6 +125,8 @@ class Scheduler:
         return {
             "max_tasks_per_gpu": int(cfg.get("max_tasks_per_gpu", 1)),
             "min_free_hbm_gb": float(cfg.get("min_free_hbm_gb", 10)),
+            "min_free_ram_gb": float(cfg.get("min_free_ram_gb", 0)),
+            "max_concurrent_tasks": int(cfg.get("max_concurrent_tasks", 0)),
             "reserved_gpus": json.loads(cfg.get("reserved_gpus", "[]")),
             "paused": cfg.get("paused", "0") == "1",
         }
@@ -153,6 +187,18 @@ class Scheduler:
                                 [(t,) for t in ids])
             self.db.commit()
 
+    def set_status(self, ids: list[int], status: str) -> None:
+        """Manually reclassify a terminal task (e.g. a 'lost' task -> done/
+        failed). Never touches running/queued tasks."""
+        if status not in ("done", "failed") or not ids:
+            return
+        with self.lock:
+            for tid in ids:
+                self.db.execute(
+                    "UPDATE tasks SET status=? WHERE id=? AND status IN "
+                    "('lost', 'done', 'failed', 'killed')", (status, tid))
+            self.db.commit()
+
     def requeue_tasks(self, ids: list[int]) -> None:
         for tid in ids:
             self._kill(tid, status="queued")
@@ -164,10 +210,27 @@ class Scheduler:
                     "WHERE id=? AND status NOT IN ('running')", (tid,))
             self.db.commit()
 
+    def retry_failed(self) -> list[int]:
+        """Requeue every failed/lost task (one-click retry)."""
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT id FROM tasks WHERE status IN ('failed', 'lost')"
+            ).fetchall()
+        ids = [r["id"] for r in rows]
+        self.requeue_tasks(ids)
+        return ids
+
     # ---- process control ----------------------------------------------------
     def _kill(self, tid: int, status: str) -> None:
         with self.lock:
             proc = self.procs.pop(tid, None)
+            orphan_pid = self.orphans.pop(tid, None)
+        # re-adopted task: kill its process group directly by PID
+        if orphan_pid and self._pid_alive(orphan_pid, None):
+            try:
+                os.killpg(os.getpgid(orphan_pid), signal.SIGTERM)
+            except Exception:
+                pass
         if proc and proc.poll() is None:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
@@ -241,6 +304,13 @@ class Scheduler:
                 counts[g] = counts.get(g, 0) + 1
         return counts
 
+    def _running_tasks(self) -> int:
+        with self.lock:
+            row = self.db.execute(
+                "SELECT COUNT(*) AS n FROM tasks WHERE status='running'"
+            ).fetchone()
+        return row["n"] if row else 0
+
     def reap(self) -> bool:
         """Collect finished processes. Returns True if anything changed."""
         changed = False
@@ -258,6 +328,19 @@ class Scheduler:
                     ("done" if rc == 0 else "failed", rc, _now(), tid))
                 self.db.commit()
             changed = True
+        # re-adopted orphans: we can't get an exit code, only liveness
+        with self.lock:
+            orphans = list(self.orphans.items())
+        for tid, pid in orphans:
+            if self._pid_alive(pid, None):
+                continue
+            with self.lock:
+                self.orphans.pop(tid, None)
+                self.db.execute(
+                    "UPDATE tasks SET status='done', ended_at=? "
+                    "WHERE id=? AND status='running'", (_now(), tid))
+                self.db.commit()
+            changed = True
         return changed
 
     def tick(self, sample: dict) -> bool:
@@ -266,9 +349,21 @@ class Scheduler:
         cfg = self.get_config()
         if cfg["paused"]:
             return changed
+        # global RAM gate: only dispatch while free RAM stays above threshold
+        min_free_ram = cfg["min_free_ram_gb"]
+        if min_free_ram > 0:
+            try:
+                avail = psutil.virtual_memory().available / 1024**3
+            except Exception:
+                avail = float("inf")
+            if avail < min_free_ram:
+                return changed
+
         reserved = set(cfg["reserved_gpus"])
         max_per = cfg["max_tasks_per_gpu"]
+        max_concurrent = cfg["max_concurrent_tasks"]
         counts = self._running_count()
+        running_total = self._running_tasks()
         ngpu = self.monitor.count or 0
 
         with self.lock:
@@ -278,6 +373,8 @@ class Scheduler:
         queued = [dict(r) for r in queued]
 
         for task in queued:
+            if max_concurrent > 0 and running_total >= max_concurrent:
+                break
             need = task["num_gpus"]
             thr = task["min_free_hbm_gb"]
             thr = cfg["min_free_hbm_gb"] if thr is None else thr
@@ -298,6 +395,7 @@ class Scheduler:
             self._launch(task, chosen)
             for g in chosen:
                 counts[g] = counts.get(g, 0) + 1
+            running_total += 1
             changed = True
         return changed
 

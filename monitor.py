@@ -36,6 +36,12 @@ class GpuMonitor:
         # per-pid caches
         self._proc_cache: dict[int, psutil.Process] = {}
         self._last_seen_ts: dict[int, int] = {}
+        # system-wide rate counters (disk / net are cumulative -> need deltas)
+        self._prev_io: Optional[dict] = None
+        try:
+            psutil.cpu_percent(None)  # prime; first call returns 0.0
+        except Exception:
+            pass
         self._init()
 
     def _init(self) -> None:
@@ -113,11 +119,44 @@ class GpuMonitor:
             pass
         return out
 
+    # ---- system-wide (CPU / RAM / disk / net) -------------------------------
+    def sample_system(self, ts: float) -> dict:
+        """Cheap host-level stats: CPU%, RAM, disk R/W and net U/D rates."""
+        out: dict = {}
+        try:
+            out["cpu"] = psutil.cpu_percent(None)
+        except Exception:
+            out["cpu"] = None
+        try:
+            vm = psutil.virtual_memory()
+            out["ram_used"] = vm.total - vm.available
+            out["ram_total"] = vm.total
+        except Exception:
+            out["ram_used"] = out["ram_total"] = None
+        try:
+            d = psutil.disk_io_counters()
+            n = psutil.net_io_counters()
+            prev = self._prev_io
+            dt = (ts - prev["ts"]) if prev else 0.0
+            if prev and dt > 0:
+                out["disk_r"] = max(0.0, (d.read_bytes - prev["dr"]) / dt)
+                out["disk_w"] = max(0.0, (d.write_bytes - prev["dw"]) / dt)
+                out["net_u"] = max(0.0, (n.bytes_sent - prev["ns"]) / dt)
+                out["net_d"] = max(0.0, (n.bytes_recv - prev["nr"]) / dt)
+            else:
+                out["disk_r"] = out["disk_w"] = out["net_u"] = out["net_d"] = 0.0
+            self._prev_io = {"ts": ts, "dr": d.read_bytes, "dw": d.write_bytes,
+                             "ns": n.bytes_sent, "nr": n.bytes_recv}
+        except Exception:
+            out["disk_r"] = out["disk_w"] = out["net_u"] = out["net_d"] = None
+        return out
+
     # ---- main sample --------------------------------------------------------
     def sample(self) -> dict:
         ts = time.time()
         if not self.ok:
-            return {"ts": ts, "ok": False, "err": self.err, "gpus": []}
+            return {"ts": ts, "ok": False, "err": self.err, "gpus": [],
+                    "sys": self.sample_system(ts)}
         gpus = []
         for i, h in enumerate(self.handles):
             st = self.static[i]
@@ -179,11 +218,16 @@ class GpuMonitor:
                 util = putil.get(pid, {})
                 name = ""
                 cmd = ""
+                user = ""
                 try:
                     pp = self._get_proc(pid)
                     if pp:
                         name = pp.name()
                         cmd = " ".join(pp.cmdline())
+                        try:
+                            user = pp.username()
+                        except Exception:
+                            user = ""
                 except Exception:
                     pass
                 pr.update({
@@ -191,9 +235,11 @@ class GpuMonitor:
                     "cpu": cpu,
                     "rss": rss,
                     "pname": name,
+                    "user": user,
                     "cmd": cmd,
                 })
             g["procs"] = sorted(procs.values(),
                                 key=lambda x: -x.get("gpu_mem", 0))
             gpus.append(g)
-        return {"ts": ts, "ok": True, "gpus": gpus}
+        return {"ts": ts, "ok": True, "gpus": gpus,
+                "sys": self.sample_system(ts)}

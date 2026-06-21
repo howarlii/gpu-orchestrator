@@ -122,6 +122,8 @@ class UpdateIn(BaseModel):
 class ConfigIn(BaseModel):
     max_tasks_per_gpu: int | None = None
     min_free_hbm_gb: float | None = None
+    min_free_ram_gb: float | None = None
+    max_concurrent_tasks: int | None = None
     reserved_gpus: list[int] | None = None
     paused: bool | None = None
 
@@ -129,6 +131,11 @@ class ConfigIn(BaseModel):
 class EvacIn(BaseModel):
     gpu: int
     reserve: bool = True
+
+
+class StatusIn(BaseModel):
+    ids: list[int]
+    status: str
 
 
 @app.post("/api/tasks")
@@ -163,6 +170,18 @@ async def del_tasks(b: IdsIn):
 @app.post("/api/tasks/requeue")
 async def requeue(b: IdsIn):
     scheduler.requeue_tasks(b.ids)
+    return {"tasks": scheduler.list_tasks()}
+
+
+@app.post("/api/tasks/retry_failed")
+async def retry_failed():
+    scheduler.retry_failed()
+    return {"tasks": scheduler.list_tasks()}
+
+
+@app.post("/api/tasks/set_status")
+async def set_status(b: StatusIn):
+    scheduler.set_status(b.ids, b.status)
     return {"tasks": scheduler.list_tasks()}
 
 
