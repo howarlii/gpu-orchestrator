@@ -1,5 +1,46 @@
 # Changelog
 
+## [0.3.0] - 2026-06-22
+### Features
+- **Per-task resource tooltip**: hovering a `running` status pill shows that
+  task's live GPU(s), HBM, SM%, CPU% and RAM, aggregated over the task's whole
+  process tree (`scheduler.task_usage()`, pushed each tick as `usage`).
+- **Pending tasks in the process table**: tasks that are `running` but have not
+  yet allocated any GPU memory now appear in the Processes table with a
+  `starting` tag, so a just-launched task is visible before it claims HBM.
+- **Dispatch cooldown** *(optional)*: new `dispatch_cooldown_s` config — after a
+  launch, the dispatcher holds off for N seconds (launches one task per window)
+  so a freshly-started task can actually claim HBM before the next is assigned,
+  preventing burst over-allocation (0 = disabled).
+- **GPU evac choice**: the per-GPU `evac` button now offers two actions —
+  *kill all* (kill+requeue everything on it, then reserve) or *no new* (reserve
+  only / drain — leave running tasks alone). Backed by `evacuate_gpu(kill=…)`.
+- **Run now**: queued tasks get a `run now` action that force-launches them
+  immediately on the GPU(s) with the most free HBM, bypassing the per-GPU cap,
+  HBM gate and cooldown (`POST /api/tasks/run_now`).
+- **Bandwidth reduction**: the heavy task list is only re-broadcast when the
+  scheduler state actually changes (revision counter), and per-process metadata
+  (command line, name, user) is sent only the first time a pid appears — clients
+  cache it. Live numeric telemetry still streams at 1 Hz.
+
+### Design Rationale
+- The task list (with full commands) and per-process command lines were re-sent
+  to every client every second; both are near-static, so a `rev` gate plus a
+  client-side pid→metadata cache cut steady-state WebSocket traffic sharply
+  without changing the 1 Hz chart cadence.
+- Config is deliberately *not* pushed on ticks — it would overwrite an input the
+  user is mid-editing; it ships via the snapshot and API responses instead.
+- `run now` bypasses the gates on purpose: it is an explicit manual override, so
+  it trusts the operator rather than the scheduler's safety thresholds.
+
+### Notes & Caveats
+- The `pause dispatch` checkbox and the redundant `reserved: …` label were
+  removed from the scheduler controls (reserved GPUs are already shown on the
+  cards); the `paused` config still exists in the backend for the CLI.
+- The bulk `set prio` now applies on **Enter** (the `apply` button is gone), and
+  `set prio` / bulk `requeue` are hidden on the *finished* tab. Per-row `requeue`
+  (↻) remains for finished/running tasks.
+
 ## [0.2.0] - 2026-06-22
 ### Features
 - **Host panel (CPU/RAM/disk/net)**: compact single-row card below the GPU grid —

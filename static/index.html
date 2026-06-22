@@ -121,10 +121,23 @@
           <div><span class="gidx" x-text="'#'+g.index"></span>
             <span class="gname" x-text="g.name"></span></div>
           <div>
-            <button class="sm warn" @click="evacuate(g.index,true)"
-              title="kill+requeue all tasks here and reserve">evac</button>
-            <button class="sm" x-show="config.reserved_gpus.includes(g.index)"
-              @click="unreserve(g.index)" title="allow scheduling again">free</button>
+            <template x-if="evacFor!==g.index">
+              <span>
+                <button class="sm warn" @click="evacFor=g.index"
+                  title="reserve this GPU (optionally kill its tasks)">evac</button>
+                <button class="sm" x-show="config.reserved_gpus.includes(g.index)"
+                  @click="unreserve(g.index)" title="allow scheduling again">free</button>
+              </span>
+            </template>
+            <template x-if="evacFor===g.index">
+              <span class="row" style="gap:4px">
+                <button class="sm danger" @click="evacuate(g.index,true)"
+                  title="kill+requeue all tasks here, then reserve">kill all</button>
+                <button class="sm warn" @click="evacuate(g.index,false)"
+                  title="just stop new tasks; let running ones finish">no new</button>
+                <button class="sm" @click="evacFor=null">✕</button>
+              </span>
+            </template>
           </div>
         </div>
         <div class="stats">
@@ -171,15 +184,18 @@
       <tbody>
         <template x-for="p in allProcs()" :key="p.gpu+'-'+p.pid">
           <tr>
-            <td><span class="gidx" x-text="'#'+p.gpu"></span></td>
+            <td><span class="gidx"
+              x-text="typeof p.gpu==='number'?'#'+p.gpu:'·'"></span></td>
             <td x-text="p.pid"></td>
             <td><b x-text="p.user||'-'"></b></td>
             <td x-text="p.sm!=null?p.sm+'%':'-'"></td>
             <td x-text="fmtGB(p.gpu_mem)"></td>
             <td x-text="p.cpu!=null?p.cpu+'%':'-'"></td>
             <td x-text="fmtGB(p.rss)"></td>
-            <td class="args"><div x-text="p.cmd||''" :title="p.cmd"
-              @scroll="syncCmd($event)"></div></td>
+            <td class="args"><div :title="p.cmd" @scroll="syncCmd($event)"
+              ><span x-show="p.pending" class="st queued"
+                style="margin-right:6px">starting</span><span
+                x-text="p.cmd||''"></span></div></td>
           </tr>
         </template>
         <tr x-show="!allProcs().length"><td colspan="8" class="muted">no GPU processes</td></tr>
@@ -200,12 +216,12 @@
       <span class="label" title="只有空闲 RAM 高于此值才继续分配 (0=关闭)">min free RAM (GB)</span>
       <input type="number" min="0" step="1" x-model.number="config.min_free_ram_gb"
         @change="saveConfig()">
-      <span class="label" title="同时运行的任务总数上限 (0=不限)">max concurrent</span>
+      <span class="label" title="同时运行的任务总数上限 (0=停止派遣新任务)">max concurrent</span>
       <input type="number" min="0" step="1" x-model.number="config.max_concurrent_tasks"
         @change="saveConfig()">
-      <label><input type="checkbox" x-model="config.paused" @change="saveConfig()">
-        pause dispatch</label>
-      <span class="label">reserved: <span x-text="config.reserved_gpus.join(',')||'none'"></span></span>
+      <span class="label" title="任务开始占用 GPU 后，等待这么多秒再分配下一个，避免一口气塞太多 (0=关闭)">dispatch cooldown (s)</span>
+      <input type="number" min="0" step="5" x-model.number="config.dispatch_cooldown_s"
+        @change="saveConfig()">
     </div>
     <div class="row foldhead" @click="toggleNewTask()">
       <strong x-text="(showNewTask?'▾':'▸')+' New task'"></strong>
@@ -252,10 +268,15 @@
         @click="retryFailed()"
         x-text="'↻ retry all failed ('+failedCount()+')'"></button>
       <span class="sp"></span>
-      <span class="label">set prio</span>
-      <input type="number" x-model.number="bulkPrio" style="width:60px">
-      <button class="sm" @click="bulkSetPrio()" :disabled="!selected.length">apply</button>
-      <button class="sm warn" @click="bulk('requeue')" :disabled="!selected.length">requeue</button>
+      <template x-if="queueTab==='active'">
+        <span class="row" style="gap:8px">
+          <span class="label">set prio</span>
+          <input type="number" x-model.number="bulkPrio" style="width:60px"
+            @keydown.enter="bulkSetPrio()" title="回车设置选中任务的优先级">
+          <button class="sm warn" @click="bulk('requeue')"
+            :disabled="!selected.length">requeue</button>
+        </span>
+      </template>
       <button class="sm danger" @click="bulk('delete')" :disabled="!selected.length">delete</button>
     </div>
     <table class="tasktable">
@@ -288,9 +309,12 @@
               </template>
               <template x-if="!(t.status==='lost' && statusEdit===t.id)">
                 <span class="st" :class="t.status"
-                  :style="t.status==='lost'?'cursor:pointer':''"
+                  :style="(t.status==='lost'||t.status==='running')?'cursor:pointer':''"
                   :title="t.status==='lost'?'click to mark done / failed':''"
                   @click.stop="t.status==='lost' && (statusEdit=t.id)"
+                  @mouseenter="t.status==='running' && showUsageTip($event,t)"
+                  @mousemove="moveUsageTip($event)"
+                  @mouseleave="usageTip=null"
                   x-text="t.status==='lost'?'lost ▾':t.status"></span>
               </template>
             </td>
@@ -299,7 +323,15 @@
             <td x-text="runtime(t)"></td>
             <td>
               <button class="sm" @click.stop="showLog(t)">log</button>
-              <button class="sm warn" @click.stop="one('requeue',t.id)">↻</button>
+              <template x-if="t.status==='queued'">
+                <button class="sm" style="color:var(--green);border-color:var(--green)"
+                  @click.stop="one('run_now',t.id)"
+                  title="run now：立刻在空闲显存最多的 GPU 上运行">▶</button>
+              </template>
+              <template x-if="t.status!=='queued'">
+                <button class="sm warn" @click.stop="one('requeue',t.id)"
+                  title="kill + requeue">↻</button>
+              </template>
               <button class="sm danger" @click.stop="one('delete',t.id)">✕</button>
             </td>
           </tr>
@@ -312,6 +344,10 @@
   <div class="cmdtip" x-show="cmdTip" :style="cmdTipStyle()"
     x-text="cmdTip?cmdTip.text:''" style="display:none"></div>
 
+  <!-- Running-task resource tooltip -->
+  <div class="cmdtip" x-show="usageTip" :style="usageTipStyle()"
+    x-text="usageTip?usageTip.text:''" style="display:none"></div>
+
   <!-- Log modal -->
   <div class="modal" x-show="logTask" @click.self="logTask=null" style="display:none">
     <div class="box">
@@ -319,6 +355,20 @@
         <span class="sp"></span>
         <label><input type="checkbox" x-model="logFollow"> follow</label>
         <button class="sm" @click="logTask=null">close</button></div>
+      <div class="row" style="gap:4px" x-show="logRuns.length>1">
+        <span class="label">run</span>
+        <template x-for="rn in logRuns" :key="rn">
+          <button class="tab" :class="{on:curRun()===rn}"
+            @click="selectRun(rn)" x-text="runLabel(rn)"
+            title="查看该次运行的日志"></button>
+        </template>
+      </div>
+      <div class="row" style="gap:6px" x-show="logPath">
+        <span class="label">path</span>
+        <span class="muted" style="user-select:all;overflow:auto;white-space:nowrap;flex:1"
+          x-text="logPath"></span>
+        <button class="sm" @click="copyLogPath()"
+          x-text="logCopied?'✓ copied':'copy'"></button></div>
       <pre x-text="logText" x-ref="logpre"></pre>
     </div>
   </div>
@@ -442,14 +492,16 @@ function redraw(i){
 function app(){
   return {
     connected:false, monitorErr:'',
-    gpus:[], tasks:[], sys:{},
+    gpus:[], tasks:[], sys:{}, usage:{},
     config:{reserved_gpus:[],max_tasks_per_gpu:1,min_free_hbm_gb:10,
-      min_free_ram_gb:0,max_concurrent_tasks:0,paused:false},
+      min_free_ram_gb:0,max_concurrent_tasks:0,dispatch_cooldown_s:0,paused:false},
     form:{command:'',name:'',priority:0,num_gpus:1,min_free_hbm_gb:'',perLine:false},
     selected:[], bulkPrio:0, queueTab:'active', filter:'', statusEdit:null,
-    cmdTip:null, copiedId:null, anchorId:null,
+    evacFor:null, _procMeta:{},
+    cmdTip:null, usageTip:null, copiedId:null, anchorId:null,
     sortKey:'id', sortDir:1,
-    logTask:null, logText:'', logFollow:true, _logTimer:null,
+    logTask:null, logText:'', logFollow:true, logCopied:false, _logTimer:null,
+    logRuns:[], logRun:null, logPath:'',
     _pidmap:{},
     oneCol: localStorage.getItem('oneCol')==='1',
     showNewTask: localStorage.getItem('showNewTask')==='1',
@@ -477,6 +529,7 @@ function app(){
         window._memtotal={};
         (m.static||[]).forEach(s=>window._memtotal[s.index]=s.mem_total);
         this.config=m.config; this.tasks=m.tasks;
+        this.mergeProcMeta(m.sample);
         this.gpus=m.sample.gpus||[];
         this.sys=m.sample.sys||{};
         this.$nextTick(()=>{
@@ -489,9 +542,11 @@ function app(){
           });
         });
       } else if(m.type==='tick'){
+        this.mergeProcMeta(m.sample);
         this.gpus=m.sample.gpus||[];
         this.sys=m.sample.sys||{};
-        this.tasks=m.tasks;
+        if(m.usage) this.usage=m.usage;
+        if(m.tasks) this.tasks=m.tasks;
         this.buildPidMap();
         this.$nextTick(()=>{
           makeCharts(this.gpus);
@@ -507,11 +562,37 @@ function app(){
       this.tasks.forEach(t=>{ if(t.pid) map[t.pid]=t.name||('#'+t.id); });
       this._pidmap=map;
     },
+    // process metadata (cmd / pname / user) is sent only the first time a pid
+    // appears (bandwidth saving); cache it client-side and refill thin samples
+    mergeProcMeta(sample){
+      const meta=this._procMeta;
+      (sample.gpus||[]).forEach(g=>(g.procs||[]).forEach(p=>{
+        if(p.cmd!=null||p.pname!=null||p.user!=null){
+          meta[p.pid]={cmd:p.cmd,pname:p.pname,user:p.user};
+        } else if(meta[p.pid]){
+          Object.assign(p,meta[p.pid]);
+        }
+      }));
+    },
     pidTask(pid){ return this._pidmap[pid]||''; },
     allProcs(){
       const out=[];
       this.gpus.forEach(g=>(g.procs||[]).forEach(p=>out.push({...p,gpu:g.index})));
-      return out.sort((a,b)=>a.gpu-b.gpu || (b.gpu_mem||0)-(a.gpu_mem||0));
+      // also surface running tasks that haven't claimed any GPU memory yet
+      this.tasks.forEach(t=>{
+        if(t.status!=='running') return;
+        const u=this.usage[t.id];
+        if(!u || u.on_gpu) return;  // unknown yet, or already shown via its GPU proc
+        const gids=(u.gpus&&u.gpus.length)?u.gpus:JSON.parse(t.gpu_ids||'[]');
+        out.push({gpu:(gids.length?gids[0]:'-'), pid:u.pid, user:'',
+          sm:null, gpu_mem:0, cpu:u.cpu, rss:u.rss,
+          cmd:t.command, pname:t.name, pending:true});
+      });
+      return out.sort((a,b)=>{
+        const ga=typeof a.gpu==='number'?a.gpu:99;
+        const gb=typeof b.gpu==='number'?b.gpu:99;
+        return ga-gb || (b.gpu_mem||0)-(a.gpu_mem||0);
+      });
     },
     syncCmd(e){
       const x=e.target.scrollLeft;
@@ -563,6 +644,7 @@ function app(){
       if(action==='delete'){ if(!confirm('delete '+ids.length+' task(s)?'))return;
         await this.api('/api/tasks','DELETE',{ids}); }
       else if(action==='requeue'){ await this.api('/api/tasks/requeue','POST',{ids}); }
+      else if(action==='run_now'){ await this.api('/api/tasks/run_now','POST',{id:ids[0]}); }
       this.selected=this.selected.filter(x=>!ids.includes(x));
     },
     async bulkSetPrio(){ await this.api('/api/tasks/update','POST',
@@ -604,9 +686,9 @@ function app(){
       min_free_hbm_gb:this.config.min_free_hbm_gb,
       min_free_ram_gb:this.config.min_free_ram_gb,
       max_concurrent_tasks:this.config.max_concurrent_tasks,
-      paused:this.config.paused}); },
-    async evacuate(gpu){ if(!confirm('evacuate GPU '+gpu+'? kills+requeues its tasks'))return;
-      await this.api('/api/evacuate','POST',{gpu,reserve:true}); },
+      dispatch_cooldown_s:this.config.dispatch_cooldown_s}); },
+    async evacuate(gpu,kill){ this.evacFor=null;
+      await this.api('/api/evacuate','POST',{gpu,reserve:true,kill}); },
     async unreserve(gpu){ const r=this.config.reserved_gpus.filter(x=>x!==gpu);
       await this.api('/api/config','POST',{reserved_gpus:r}); },
 
@@ -616,6 +698,21 @@ function app(){
       // default ordering per tab: finished → most recently ended first
       if(tab==='finished'){ this.sortKey='ended_at'; this.sortDir=-1; }
       else { this.sortKey='id'; this.sortDir=1; } },
+    // running-task resource tooltip (CPU / GPU usage of the task itself)
+    usageText(t){
+      const u=this.usage[t.id];
+      if(!u) return 'gathering usage…';
+      const g=(u.gpus&&u.gpus.length)?u.gpus.join(','):'-';
+      return 'GPU '+g+(u.on_gpu?'':'  (not on GPU yet)')
+        +'\nHBM '+this.fmtGB(u.gpu_mem)+'   SM '+(u.sm||0)+'%'
+        +'\nCPU '+(u.cpu==null?'-':u.cpu+'%')+'   RAM '+this.fmtGB(u.rss);
+    },
+    showUsageTip(e,t){ this.usageTip={text:this.usageText(t),x:e.clientX,y:e.clientY}; },
+    moveUsageTip(e){ if(this.usageTip){ this.usageTip.x=e.clientX; this.usageTip.y=e.clientY; } },
+    usageTipStyle(){ if(!this.usageTip)return '';
+      const x=Math.min(this.usageTip.x+14, window.innerWidth-260);
+      const y=Math.min(this.usageTip.y+16, window.innerHeight-80);
+      return `left:${Math.max(8,x)}px;top:${Math.max(8,y)}px`; },
     // command copy + hover tooltip
     showCmdTip(e,text){ this.cmdTip={text,x:e.clientX,y:e.clientY}; },
     moveCmdTip(e){ if(this.cmdTip){ this.cmdTip.x=e.clientX; this.cmdTip.y=e.clientY; } },
@@ -623,14 +720,20 @@ function app(){
       const x=Math.min(this.cmdTip.x+14, window.innerWidth-360);
       const y=Math.min(this.cmdTip.y+16, window.innerHeight-80);
       return `left:${Math.max(8,x)}px;top:${Math.max(8,y)}px`; },
-    async copyCmd(t){
-      const txt=t.command||'';
+    async clip(txt){
       try{ await navigator.clipboard.writeText(txt); }
       catch(_){ const ta=document.createElement('textarea'); ta.value=txt;
         ta.style.position='fixed'; ta.style.opacity='0'; document.body.appendChild(ta);
         ta.select(); try{document.execCommand('copy');}catch(__){} ta.remove(); }
+    },
+    async copyCmd(t){
+      await this.clip(t.command||'');
       this.copiedId=t.id;
       setTimeout(()=>{ if(this.copiedId===t.id)this.copiedId=null; },1200);
+    },
+    async copyLogPath(){ if(!this.logPath)return;
+      await this.clip(this.logPath);
+      this.logCopied=true; setTimeout(()=>{ this.logCopied=false; },1200);
     },
     isActive(t){ return t.status==='running'||t.status==='queued'; },
     inTab(t){ return this.queueTab==='active' ? this.isActive(t) : !this.isActive(t); },
@@ -666,13 +769,21 @@ function app(){
       return m>=60?Math.floor(m/60)+'h'+(m%60)+'m':m+'m'+sec+'s'; },
 
     // log
-    async showLog(t){ this.logTask=t; this.logText='loading…'; await this.refreshLog();
+    async showLog(t){ this.logTask=t; this.logText='loading…';
+      this.logRun=null; this.logRuns=[]; this.logPath=''; await this.refreshLog();
       clearInterval(this._logTimer);
       this._logTimer=setInterval(()=>{ if(this.logTask&&this.logFollow)this.refreshLog(); },2000);
     },
+    selectRun(rn){ this.logRun=rn; this.logText='loading…'; this.refreshLog(); },
+    curRun(){ return this.logRun!=null ? this.logRun
+      : (this.logRuns.length?this.logRuns[this.logRuns.length-1]:null); },
+    runLabel(rn){ return rn===0?'old':('#'+rn); },
     async refreshLog(){ if(!this.logTask)return;
-      const r=await fetch('/api/tasks/'+this.logTask.id+'/log?tail=400');
-      const d=await r.json(); this.logText=d.log||'(empty)';
+      const q='/api/tasks/'+this.logTask.id+'/log?tail=400'
+        +(this.logRun!=null?'&run='+this.logRun:'');
+      const r=await fetch(q); const d=await r.json();
+      this.logText=d.log||'(empty)';
+      this.logRuns=d.runs||[]; this.logPath=d.path||'';
       this.$nextTick(()=>{const p=this.$refs.logpre; if(p&&this.logFollow)p.scrollTop=p.scrollHeight;});
     },
   };

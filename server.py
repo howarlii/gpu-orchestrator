@@ -29,6 +29,32 @@ history: dict[int, collections.deque] = {
 }
 _latest: dict = {"ts": 0, "ok": monitor.ok, "gpus": []}
 _clients: set[WebSocket] = set()
+# bandwidth diffing: only resend the (heavy) task list / config when the
+# scheduler's revision changes, and only resend a process' static metadata
+# (command line, name, user) the first time we see its pid.
+_last_rev = -1
+_seen_pids: set[int] = set()
+_META_KEYS = ("cmd", "pname", "user")
+
+
+def _thin_sample(sample: dict) -> dict:
+    """Copy of ``sample`` with per-process metadata stripped for pids the
+    clients already know about (they cache it). Keeps live numeric fields."""
+    gpus_out = []
+    cur: set[int] = set()
+    for g in sample.get("gpus", []):
+        procs_out = []
+        for pr in g.get("procs", []):
+            cur.add(pr["pid"])
+            if pr["pid"] in _seen_pids:
+                procs_out.append({k: v for k, v in pr.items()
+                                  if k not in _META_KEYS})
+            else:
+                procs_out.append(pr)
+        gpus_out.append({**g, "procs": procs_out})
+    _seen_pids.clear()
+    _seen_pids.update(cur)
+    return {**sample, "gpus": gpus_out}
 
 
 def _record(sample: dict) -> None:
@@ -43,16 +69,28 @@ def _record(sample: dict) -> None:
 
 
 async def _monitor_loop() -> None:
+    global _last_rev
     loop = asyncio.get_event_loop()
     while True:
         sample = await loop.run_in_executor(None, monitor.sample)
         _record(sample)
         await loop.run_in_executor(None, scheduler.reap)
+        if not _clients:
+            await asyncio.sleep(SAMPLE_INTERVAL)
+            continue
+        usage = await loop.run_in_executor(None, scheduler.task_usage, sample)
+        msg = {"type": "tick", "sample": _thin_sample(sample), "usage": usage}
+        # the task list is heavy and rarely changes: only resend on bump.
+        # (config is intentionally NOT pushed here — it would clobber an input
+        #  the user is mid-editing; it ships via snapshot and API responses.)
+        rev = scheduler.get_rev()
+        if rev != _last_rev:
+            msg["tasks"] = scheduler.list_tasks()
+            _last_rev = rev
         dead = []
         for ws in list(_clients):
             try:
-                await ws.send_json({"type": "tick", "sample": sample,
-                                    "tasks": scheduler.list_tasks()})
+                await ws.send_json(msg)
             except Exception:
                 dead.append(ws)
         for ws in dead:
@@ -124,6 +162,7 @@ class ConfigIn(BaseModel):
     min_free_hbm_gb: float | None = None
     min_free_ram_gb: float | None = None
     max_concurrent_tasks: int | None = None
+    dispatch_cooldown_s: float | None = None
     reserved_gpus: list[int] | None = None
     paused: bool | None = None
 
@@ -131,6 +170,11 @@ class ConfigIn(BaseModel):
 class EvacIn(BaseModel):
     gpu: int
     reserve: bool = True
+    kill: bool = True
+
+
+class RunNowIn(BaseModel):
+    id: int
 
 
 class StatusIn(BaseModel):
@@ -179,6 +223,12 @@ async def retry_failed():
     return {"tasks": scheduler.list_tasks()}
 
 
+@app.post("/api/tasks/run_now")
+async def run_now(b: RunNowIn):
+    scheduler.run_now(b.id, _latest)
+    return {"tasks": scheduler.list_tasks()}
+
+
 @app.post("/api/tasks/set_status")
 async def set_status(b: StatusIn):
     scheduler.set_status(b.ids, b.status)
@@ -195,8 +245,8 @@ async def update(b: UpdateIn):
 
 
 @app.get("/api/tasks/{tid}/log")
-async def get_log(tid: int, tail: int = 300):
-    return {"log": scheduler.read_log(tid, tail)}
+async def get_log(tid: int, tail: int = 300, run: int | None = None):
+    return scheduler.read_log(tid, tail, run)
 
 
 @app.post("/api/config")
@@ -207,6 +257,6 @@ async def set_config(b: ConfigIn):
 
 @app.post("/api/evacuate")
 async def evacuate(b: EvacIn):
-    scheduler.evacuate_gpu(b.gpu, b.reserve)
+    scheduler.evacuate_gpu(b.gpu, b.reserve, b.kill)
     return {"tasks": scheduler.list_tasks(),
             "config": scheduler.get_config()}
