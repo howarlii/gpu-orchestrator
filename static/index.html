@@ -222,6 +222,14 @@
       <span class="label" title="任务开始占用 GPU 后，等待这么多秒再分配下一个，避免一口气塞太多 (0=关闭)">dispatch cooldown (s)</span>
       <input type="number" min="0" step="5" x-model.number="config.dispatch_cooldown_s"
         @change="saveConfig()">
+      <span class="label" title="某 GPU 最近5分钟平均使用率达到此值后，停止再往该卡派发新任务，避免满负载的卡被塞入过多任务 (0=关闭)">max GPU util % (5m)</span>
+      <input type="number" min="0" max="100" step="5" x-model.number="config.max_gpu_util_pct"
+        @change="saveConfig()">
+    </div>
+    <div class="row" x-show="dispatch.reason">
+      <span class="label">dispatch</span>
+      <span class="st" :class="dispatchClass()" x-text="dispatch.reason"
+        title="当前调度状态 / 没有派发任务时被什么限制住"></span>
     </div>
     <div class="row foldhead" @click="toggleNewTask()">
       <strong x-text="(showNewTask?'▾':'▸')+' New task'"></strong>
@@ -269,15 +277,17 @@
         x-text="'↻ retry all failed ('+failedCount()+')'"></button>
       <span class="sp"></span>
       <template x-if="queueTab==='active'">
-        <span class="row" style="gap:8px">
-          <span class="label">set prio</span>
-          <input type="number" x-model.number="bulkPrio" style="width:60px"
-            @keydown.enter="bulkSetPrio()" title="回车设置选中任务的优先级">
-          <button class="sm warn" @click="bulk('requeue')"
-            :disabled="!selected.length">requeue</button>
+        <span class="row" style="gap:6px" x-show="selected.length">
+          <button class="sm" style="color:var(--green);border-color:var(--green)"
+            @click="startSelected()"
+            title="一键启动选中的排队任务（按调度间隔逐个启动，避免一次性爆 RAM）">▶ start</button>
+          <button class="sm" @click="pinTop()"
+            title="置顶：让选中的排队任务优先调度">📌 pin top</button>
+          <button class="sm warn" @click="bulk('requeue')">requeue</button>
         </span>
       </template>
-      <button class="sm danger" @click="bulk('delete')" :disabled="!selected.length">delete</button>
+      <button class="sm danger" x-show="selected.length"
+        @click="bulk('delete')">delete</button>
     </div>
     <table class="tasktable">
       <thead><tr>
@@ -492,11 +502,12 @@ function redraw(i){
 function app(){
   return {
     connected:false, monitorErr:'',
-    gpus:[], tasks:[], sys:{}, usage:{},
+    gpus:[], tasks:[], sys:{}, usage:{}, dispatch:{state:'',reason:''},
     config:{reserved_gpus:[],max_tasks_per_gpu:1,min_free_hbm_gb:10,
-      min_free_ram_gb:0,max_concurrent_tasks:0,dispatch_cooldown_s:0,paused:false},
+      min_free_ram_gb:0,max_concurrent_tasks:0,dispatch_cooldown_s:0,
+      max_gpu_util_pct:0,paused:false},
     form:{command:'',name:'',priority:0,num_gpus:1,min_free_hbm_gb:'',perLine:false},
-    selected:[], bulkPrio:0, queueTab:'active', filter:'', statusEdit:null,
+    selected:[], queueTab:'active', filter:'', statusEdit:null,
     evacFor:null, _procMeta:{},
     cmdTip:null, usageTip:null, copiedId:null, anchorId:null,
     sortKey:'id', sortDir:1,
@@ -529,6 +540,7 @@ function app(){
         window._memtotal={};
         (m.static||[]).forEach(s=>window._memtotal[s.index]=s.mem_total);
         this.config=m.config; this.tasks=m.tasks;
+        if(m.dispatch)this.dispatch=m.dispatch;
         this.mergeProcMeta(m.sample);
         this.gpus=m.sample.gpus||[];
         this.sys=m.sample.sys||{};
@@ -547,6 +559,7 @@ function app(){
         this.sys=m.sample.sys||{};
         if(m.usage) this.usage=m.usage;
         if(m.tasks) this.tasks=m.tasks;
+        if(m.dispatch) this.dispatch=m.dispatch;
         this.buildPidMap();
         this.$nextTick(()=>{
           makeCharts(this.gpus);
@@ -647,8 +660,13 @@ function app(){
       else if(action==='run_now'){ await this.api('/api/tasks/run_now','POST',{id:ids[0]}); }
       this.selected=this.selected.filter(x=>!ids.includes(x));
     },
-    async bulkSetPrio(){ await this.api('/api/tasks/update','POST',
-      {ids:[...this.selected],priority:this.bulkPrio}); },
+    async startSelected(){ const ids=[...this.selected]; if(!ids.length)return;
+      await this.api('/api/tasks/start','POST',{ids}); },
+    async pinTop(){ const ids=[...this.selected]; if(!ids.length)return;
+      await this.api('/api/tasks/pin','POST',{ids}); },
+    dispatchClass(){ const s=(this.dispatch&&this.dispatch.state)||'';
+      return ({dispatching:'running',idle:'done',paused:'killed',
+        cooldown:'killed',blocked:'failed'})[s]||'queued'; },
     failedCount(){ return this.tasks.filter(t=>
       t.status==='failed'||t.status==='lost').length; },
     async retryFailed(){ const n=this.failedCount(); if(!n)return;
@@ -686,7 +704,8 @@ function app(){
       min_free_hbm_gb:this.config.min_free_hbm_gb,
       min_free_ram_gb:this.config.min_free_ram_gb,
       max_concurrent_tasks:this.config.max_concurrent_tasks,
-      dispatch_cooldown_s:this.config.dispatch_cooldown_s}); },
+      dispatch_cooldown_s:this.config.dispatch_cooldown_s,
+      max_gpu_util_pct:this.config.max_gpu_util_pct}); },
     async evacuate(gpu,kill){ this.evacFor=null;
       await this.api('/api/evacuate','POST',{gpu,reserve:true,kill}); },
     async unreserve(gpu){ const r=this.config.reserved_gpus.filter(x=>x!==gpu);

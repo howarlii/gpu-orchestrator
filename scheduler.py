@@ -47,6 +47,13 @@ class Scheduler:
         self.rev = 0
         # timestamp of the most recent dispatch, for the optional cooldown gate
         self._last_launch_ts = 0.0
+        # task ids the user force-started ("一键启动"): launched one-per-tick,
+        # bypassing pause / HBM gate / per-GPU cap, but still gated by the RAM
+        # check and dispatch cooldown so a batch start can't blow up RAM.
+        self._force_ids: set[int] = set()
+        # last computed dispatch status, surfaced in the UI so the operator can
+        # see *why* nothing is currently being dispatched.
+        self.dispatch_state: dict = {"state": "idle", "reason": "starting"}
         self.db = sqlite3.connect(DB_PATH, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self._init_db()
@@ -91,6 +98,9 @@ class Scheduler:
                 "min_free_ram_gb": "0",       # 0 = no RAM gate
                 "max_concurrent_tasks": "0",  # 0 = stop dispatching (pause)
                 "dispatch_cooldown_s": "0",   # 0 = no cooldown between launches
+                "max_gpu_util_pct": "0",      # >0: don't dispatch to a GPU whose
+                                              # 5-min avg util is >= this (avoid
+                                              # piling tasks onto a busy GPU)
                 "reserved_gpus": "[]",
                 "paused": "0",
             }
@@ -142,6 +152,7 @@ class Scheduler:
             "min_free_ram_gb": float(cfg.get("min_free_ram_gb", 0)),
             "max_concurrent_tasks": int(cfg.get("max_concurrent_tasks", 0)),
             "dispatch_cooldown_s": float(cfg.get("dispatch_cooldown_s", 0)),
+            "max_gpu_util_pct": float(cfg.get("max_gpu_util_pct", 0)),
             "reserved_gpus": json.loads(cfg.get("reserved_gpus", "[]")),
             "paused": cfg.get("paused", "0") == "1",
         }
@@ -339,6 +350,38 @@ class Scheduler:
         self._launch(task, cands[:need])
         return True
 
+    def pin_tasks(self, ids: list[int]) -> None:
+        """置顶: float selected queued tasks above all others so they dispatch
+        first. No explicit numeric priority — just bump them to the top."""
+        if not ids:
+            return
+        with self.lock:
+            row = self.db.execute(
+                "SELECT MAX(priority) AS m FROM tasks WHERE status='queued'"
+            ).fetchone()
+            top = (row["m"] or 0) + 1
+            for tid in ids:
+                self.db.execute(
+                    "UPDATE tasks SET priority=? WHERE id=? AND status='queued'",
+                    (top, tid))
+            self.db.commit()
+            self._bump()
+
+    def run_now_many(self, ids: list[int]) -> None:
+        """一键启动: queue selected tasks for forced launch. They start one per
+        dispatch tick (~2s apart) on the GPU(s) with most free HBM, bypassing
+        the RAM gate, dispatch cooldown, pause, HBM gate and per-GPU cap — an
+        explicit operator override. Reserved GPUs are still avoided."""
+        if not ids:
+            return
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT id FROM tasks WHERE status='queued' AND id IN (%s)"
+                % ",".join("?" * len(ids)), ids).fetchall()
+            for r in rows:
+                self._force_ids.add(r["id"])
+            self._bump()
+
     def task_usage(self, sample: dict) -> dict:
         """Per running task: live GPU-mem / SM (matched from the sample's GPU
         processes by walking each task's process tree) plus CPU / RAM. Includes
@@ -447,51 +490,131 @@ class Scheduler:
             changed = True
         return changed
 
-    def tick(self, sample: dict) -> bool:
-        """One dispatch step. Returns True if state changed."""
+    def _set_state(self, state: str, reason: str) -> None:
+        """Record the current dispatch status for the UI."""
+        self.dispatch_state = {"state": state, "reason": reason, "ts": _now()}
+
+    def _why_blocked(self, task: dict, sample: dict, cfg: dict, counts: dict,
+                     reserved: set, ngpu: int, util_avg: Optional[dict]) -> str:
+        """Per-GPU breakdown of why the top queued task can't be placed."""
+        thr = task["min_free_hbm_gb"]
+        thr = cfg["min_free_hbm_gb"] if thr is None else thr
+        max_per = cfg["max_tasks_per_gpu"]
+        max_util = cfg["max_gpu_util_pct"]
+        n_res = n_cap = n_busy = n_hbm = 0
+        for gpu in range(ngpu):
+            if gpu in reserved:
+                n_res += 1
+                continue
+            if counts.get(gpu, 0) >= max_per:
+                n_cap += 1
+                continue
+            gavg = (util_avg or {}).get(gpu)
+            if max_util > 0 and gavg is not None and gavg >= max_util:
+                n_busy += 1
+                continue
+            if self._free_hbm_gb(gpu, sample) < thr:
+                n_hbm += 1
+        parts = [f"{n_res} reserved", f"{n_cap} at task cap"]
+        if max_util > 0:
+            parts.append(f"{n_busy} busy (util≥{max_util:.0f}%)")
+        parts.append(f"{n_hbm} below {thr:.0f}G free HBM")
+        return (f"no GPU free for task #{task['id']} (needs "
+                f"{task['num_gpus']}): " + ", ".join(parts))
+
+    def tick(self, sample: dict, util_avg: Optional[dict] = None) -> bool:
+        """One dispatch step. Returns True if state changed.
+
+        Launches at most ONE task per tick so a freshly-started task can claim
+        RAM/HBM before the next dispatch decision — this prevents a burst of
+        simultaneous launches from blowing up RAM. Force-started ("一键启动")
+        tasks are dispatched first, also one per tick.
+        """
         changed = self.reap()
         cfg = self.get_config()
-        if cfg["paused"]:
-            return changed
-        # global RAM gate: only dispatch while free RAM stays above threshold
+        now = _now()
+        ngpu = self.monitor.count or 0
+        reserved = set(cfg["reserved_gpus"])
+
+        # ---- global gates shared by forced + normal dispatch ----------------
         min_free_ram = cfg["min_free_ram_gb"]
+        ram_avail: Optional[float] = None
         if min_free_ram > 0:
             try:
-                avail = psutil.virtual_memory().available / 1024**3
+                ram_avail = psutil.virtual_memory().available / 1024**3
             except Exception:
-                avail = float("inf")
-            if avail < min_free_ram:
-                return changed
+                ram_avail = float("inf")
+        ram_blocked = ram_avail is not None and ram_avail < min_free_ram
 
-        # optional dispatch cooldown: after a launch, hold off dispatching the
-        # next task so a freshly-started task has time to actually claim HBM
-        # (otherwise its GPU still looks free and we over-allocate it).
+        # dispatch cooldown: after a launch, hold off so the new task can
+        # actually claim HBM/RAM before the next dispatch decision. Applies to
+        # *every* launch (forced included).
         cooldown = cfg["dispatch_cooldown_s"]
-        if cooldown > 0 and (_now() - self._last_launch_ts) < cooldown:
-            return changed
-
-        # max_concurrent_tasks == 0 means "stop dispatching" (this is the pause
-        # control now that the explicit pause checkbox is gone); a positive
-        # value is a hard cap on total running tasks.
-        if cfg["max_concurrent_tasks"] == 0:
-            return changed
-
-        reserved = set(cfg["reserved_gpus"])
-        max_per = cfg["max_tasks_per_gpu"]
-        max_concurrent = cfg["max_concurrent_tasks"]
-        counts = self._running_count()
-        running_total = self._running_tasks()
-        ngpu = self.monitor.count or 0
+        cooldown_left = (max(0.0, cooldown - (now - self._last_launch_ts))
+                         if cooldown > 0 else 0.0)
+        cooldown_blocked = cooldown_left > 0
 
         with self.lock:
-            queued = self.db.execute(
+            queued = [dict(r) for r in self.db.execute(
                 "SELECT * FROM tasks WHERE status='queued' "
-                "ORDER BY priority DESC, id ASC").fetchall()
-        queued = [dict(r) for r in queued]
+                "ORDER BY priority DESC, id ASC").fetchall()]
+            self._force_ids &= {t["id"] for t in queued}  # drop stale ids
+            force_ids = set(self._force_ids)
+
+        # ---- forced launches (一键启动): explicit operator override. Ignores
+        #      the RAM gate, dispatch cooldown, pause, HBM gate, per-GPU cap and
+        #      concurrency limit. Only the one-launch-per-tick spacing (~2s) and
+        #      reserved-GPU avoidance still apply. ---------------------------
+        if force_ids:
+            ftask = next((t for t in queued if t["id"] in force_ids), None)
+            if ftask:
+                need = ftask["num_gpus"]
+                cands = [g for g in range(ngpu) if g not in reserved]
+                if len(cands) >= need:
+                    cands.sort(key=lambda g: -self._free_hbm_gb(g, sample))
+                    chosen = cands[:need]
+                    self._launch(ftask, chosen)
+                    with self.lock:
+                        self._force_ids.discard(ftask["id"])
+                    self._set_state("dispatching", f"force-started task "
+                                    f"#{ftask['id']} on GPU {chosen}")
+                    return True
+                self._set_state("blocked", f"force-start task #{ftask['id']}: "
+                                f"needs {need} GPU(s), only {len(cands)} "
+                                f"unreserved")
+                return changed
+
+        # ---- normal gated dispatch ------------------------------------------
+        if cfg["paused"]:
+            self._set_state("paused", "paused")
+            return changed
+        if cfg["max_concurrent_tasks"] == 0:
+            self._set_state("paused", "max concurrent = 0 (dispatch paused)")
+            return changed
+        if ram_blocked:
+            self._set_state("blocked", f"free RAM {ram_avail:.0f}G < min "
+                            f"{min_free_ram:.0f}G")
+            return changed
+        if cooldown_blocked:
+            self._set_state("cooldown",
+                            f"dispatch delay: {cooldown_left:.0f}s left")
+            return changed
+        if not queued:
+            self._set_state("idle", "no queued tasks")
+            return changed
+
+        max_per = cfg["max_tasks_per_gpu"]
+        max_concurrent = cfg["max_concurrent_tasks"]
+        max_util = cfg["max_gpu_util_pct"]
+        counts = self._running_count()
+        running_total = self._running_tasks()
+
+        if running_total >= max_concurrent:
+            self._set_state("blocked", f"running {running_total} ≥ max "
+                            f"concurrent {max_concurrent}")
+            return changed
 
         for task in queued:
-            if max_concurrent > 0 and running_total >= max_concurrent:
-                break
             need = task["num_gpus"]
             thr = task["min_free_hbm_gb"]
             thr = cfg["min_free_hbm_gb"] if thr is None else thr
@@ -501,6 +624,12 @@ class Scheduler:
                     continue
                 if counts.get(gpu, 0) >= max_per:
                     continue
+                # low-util gate: don't pile more work onto a GPU that is already
+                # busy (5-min avg util at/above the threshold).
+                if max_util > 0:
+                    gavg = (util_avg or {}).get(gpu)
+                    if gavg is not None and gavg >= max_util:
+                        continue
                 if self._free_hbm_gb(gpu, sample) < thr:
                     continue
                 cands.append(gpu)
@@ -510,13 +639,13 @@ class Scheduler:
             cands.sort(key=lambda g: (counts.get(g, 0), g))
             chosen = cands[:need]
             self._launch(task, chosen)
-            for g in chosen:
-                counts[g] = counts.get(g, 0) + 1
-            running_total += 1
-            changed = True
-            if cooldown > 0:
-                # one launch per cooldown window
-                break
+            self._set_state("dispatching",
+                            f"started task #{task['id']} on GPU {chosen}")
+            return True
+
+        # queued tasks exist but none could be placed this tick
+        self._set_state("blocked", self._why_blocked(
+            queued[0], sample, cfg, counts, reserved, ngpu, util_avg))
         return changed
 
     def _run_logs(self, tid: int) -> list[int]:

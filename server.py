@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import time
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -79,7 +80,8 @@ async def _monitor_loop() -> None:
             await asyncio.sleep(SAMPLE_INTERVAL)
             continue
         usage = await loop.run_in_executor(None, scheduler.task_usage, sample)
-        msg = {"type": "tick", "sample": _thin_sample(sample), "usage": usage}
+        msg = {"type": "tick", "sample": _thin_sample(sample), "usage": usage,
+               "dispatch": scheduler.dispatch_state}
         # the task list is heavy and rarely changes: only resend on bump.
         # (config is intentionally NOT pushed here — it would clobber an input
         #  the user is mid-editing; it ships via snapshot and API responses.)
@@ -98,10 +100,22 @@ async def _monitor_loop() -> None:
         await asyncio.sleep(SAMPLE_INTERVAL)
 
 
+def _util_avg(window_s: float = 300.0) -> dict[int, float]:
+    """Per-GPU mean utilisation over the last ``window_s`` seconds, from the
+    rolling history. Feeds the low-util dispatch gate (max_gpu_util_pct)."""
+    now = time.time()
+    out: dict[int, float] = {}
+    for i, h in history.items():
+        vals = [r[1] for r in h if r[1] is not None and now - r[0] <= window_s]
+        if vals:
+            out[i] = sum(vals) / len(vals)
+    return out
+
+
 async def _dispatch_loop() -> None:
     loop = asyncio.get_event_loop()
     while True:
-        await loop.run_in_executor(None, scheduler.tick, _latest)
+        await loop.run_in_executor(None, scheduler.tick, _latest, _util_avg())
         await asyncio.sleep(DISPATCH_INTERVAL)
 
 
@@ -128,6 +142,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
             "sample": _latest,
             "tasks": scheduler.list_tasks(),
             "config": scheduler.get_config(),
+            "dispatch": scheduler.dispatch_state,
             "monitor_ok": monitor.ok,
             "monitor_err": monitor.err,
         })
@@ -163,6 +178,7 @@ class ConfigIn(BaseModel):
     min_free_ram_gb: float | None = None
     max_concurrent_tasks: int | None = None
     dispatch_cooldown_s: float | None = None
+    max_gpu_util_pct: float | None = None
     reserved_gpus: list[int] | None = None
     paused: bool | None = None
 
@@ -226,6 +242,20 @@ async def retry_failed():
 @app.post("/api/tasks/run_now")
 async def run_now(b: RunNowIn):
     scheduler.run_now(b.id, _latest)
+    return {"tasks": scheduler.list_tasks()}
+
+
+@app.post("/api/tasks/start")
+async def start_tasks(b: IdsIn):
+    """一键启动: force-launch selected queued tasks, staggered one per tick."""
+    scheduler.run_now_many(b.ids)
+    return {"tasks": scheduler.list_tasks()}
+
+
+@app.post("/api/tasks/pin")
+async def pin_tasks(b: IdsIn):
+    """置顶: bump selected queued tasks to the top of the queue."""
+    scheduler.pin_tasks(b.ids)
     return {"tasks": scheduler.list_tasks()}
 
 

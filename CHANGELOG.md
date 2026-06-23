@@ -1,5 +1,53 @@
 # Changelog
 
+## [0.4.0] - 2026-06-23
+### Features
+- **Batch one-click start (一键启动)**: with tasks selected on the *active* tab, a
+  `▶ start` button force-launches the selected queued tasks. As an explicit
+  operator override it **bypasses** the RAM gate, dispatch cooldown, pause, HBM
+  gate and per-GPU cap; only the one-launch-per-tick spacing (~2 s) and
+  reserved-GPU avoidance still apply, so the batch starts promptly but is still
+  staggered rather than firing literally all at once
+  (`POST /api/tasks/start` → `Scheduler.run_now_many`).
+- **Pin to top (置顶)**: `set prio` (numeric) is replaced by a `📌 pin top`
+  button that floats selected queued tasks above the rest — "run first" with no
+  explicit priority value (`POST /api/tasks/pin` → `Scheduler.pin_tasks`).
+- **Selection-aware toolbar**: `start` / `pin` / `requeue` / `delete` are hidden
+  when nothing is selected.
+- **Dispatch delay applies to every launch**: the dispatcher now launches **at
+  most one task per tick** (forced launches included), giving each freshly
+  started task time to claim RAM/HBM before the next dispatch decision —
+  directly fixing the "multiple tasks start at once → RAM blow-up" issue.
+- **Low-util dispatch gate**: new `max_gpu_util_pct` config — a GPU whose recent
+  **5-min average utilization** is at/above this value is skipped for new
+  dispatch, preventing a busy/full GPU from being over-stuffed with tasks
+  (0 = disabled). The 5-min average is computed server-side from the rolling
+  history and passed into `Scheduler.tick`.
+- **Dispatch status display**: the Scheduler panel shows a live `dispatch` line
+  explaining the current state — `dispatching` / `idle` / `paused` / `cooldown`
+  / `blocked` — and, when blocked, *why* (RAM gate, cooldown, max-concurrent, or
+  a per-GPU breakdown of reserved / at-cap / busy / low-HBM). Pushed every tick
+  as `dispatch` (`Scheduler.dispatch_state`).
+
+### Design Rationale
+- Force-started tasks deliberately bypass every dispatch gate (RAM, cooldown,
+  pause, HBM, per-GPU cap, concurrency) — it is an explicit manual override, so
+  it trusts the operator. The one-launch-per-tick spacing is retained as the
+  only safety against an instantaneous RAM spike from a large batch.
+- The util gate is a *limit*, not an override: it reads "only keep dispatching to
+  a GPU while its 5-min avg util is below the threshold", so an already-saturated
+  GPU stops receiving new work even if it has spare HBM and task-cap headroom.
+- One-launch-per-tick replaces the old "one-per-cooldown-window only when
+  cooldown > 0" rule, so even with no cooldown configured, launches are spaced by
+  the 2 s dispatch interval instead of bursting within a single tick.
+
+### Notes & Caveats
+- A force-started task that needs more GPUs than are currently unreserved will
+  block forced dispatch and surface that as the `dispatch` reason rather than
+  silently downgrading; free a GPU or delete the task to unblock.
+- Server **not** restarted for this change set (per request) — the new behavior
+  takes effect on the next restart.
+
 ## [0.3.0] - 2026-06-22
 ### Features
 - **Per-task resource tooltip**: hovering a `running` status pill shows that
