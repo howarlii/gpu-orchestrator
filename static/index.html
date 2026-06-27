@@ -286,6 +286,9 @@
           <button class="sm warn" @click="bulk('requeue')">requeue</button>
         </span>
       </template>
+      <button class="sm warn" x-show="queueTab==='finished' && selected.length"
+        @click="bulk('requeue')"
+        x-text="'↻ requeue ('+selected.length+')'"></button>
       <button class="sm danger" x-show="selected.length"
         @click="bulk('delete')">delete</button>
     </div>
@@ -511,13 +514,15 @@ function app(){
     evacFor:null, _procMeta:{},
     cmdTip:null, usageTip:null, copiedId:null, anchorId:null,
     sortKey:'id', sortDir:1,
+    nowTs:Date.now()/1000, clockOffset:0,
     logTask:null, logText:'', logFollow:true, logCopied:false, _logTimer:null,
     logRuns:[], logRun:null, logPath:'',
     _pidmap:{},
     oneCol: localStorage.getItem('oneCol')==='1',
     showNewTask: localStorage.getItem('showNewTask')==='1',
 
-    init(){ this.connect(); },
+    init(){ this.connect();
+      setInterval(()=>{ this.nowTs=Date.now()/1000+this.clockOffset; },1000); },
     toggleNewTask(){ this.showNewTask=!this.showNewTask;
       localStorage.setItem('showNewTask', this.showNewTask?'1':'0'); },
     _resizeCharts(){ requestAnimationFrame(()=>
@@ -540,6 +545,8 @@ function app(){
         window._memtotal={};
         (m.static||[]).forEach(s=>window._memtotal[s.index]=s.mem_total);
         this.config=m.config; this.tasks=m.tasks;
+        if(m.sample&&m.sample.ts){ this.clockOffset=m.sample.ts-Date.now()/1000;
+          this.nowTs=Date.now()/1000+this.clockOffset; }
         if(m.dispatch)this.dispatch=m.dispatch;
         this.mergeProcMeta(m.sample);
         this.gpus=m.sample.gpus||[];
@@ -557,6 +564,7 @@ function app(){
         this.mergeProcMeta(m.sample);
         this.gpus=m.sample.gpus||[];
         this.sys=m.sample.sys||{};
+        if(m.sample&&m.sample.ts){ this.clockOffset=m.sample.ts-Date.now()/1000; }
         if(m.usage) this.usage=m.usage;
         if(m.tasks) this.tasks=m.tasks;
         if(m.dispatch) this.dispatch=m.dispatch;
@@ -651,9 +659,9 @@ function app(){
       }
       this.form.command='';this.form.name='';
     },
-    one(action,id){ this.dispatch(action,[id]); },
-    bulk(action){ if(this.selected.length)this.dispatch(action,[...this.selected]); },
-    async dispatch(action,ids){
+    one(action,id){ this.act(action,[id]); },
+    bulk(action){ if(this.selected.length)this.act(action,[...this.selected]); },
+    async act(action,ids){
       if(action==='delete'){ if(!confirm('delete '+ids.length+' task(s)?'))return;
         await this.api('/api/tasks','DELETE',{ids}); }
       else if(action==='requeue'){ await this.api('/api/tasks/requeue','POST',{ids}); }
@@ -782,7 +790,7 @@ function app(){
       });
     },
     _rt(t){ if(!t.started_at)return 0;
-      return (t.ended_at||Date.now()/1000)-t.started_at; },
+      return Math.max(0,(t.ended_at||this.nowTs)-t.started_at); },
     runtime(t){ const s=this._rt(t); if(!s)return '-';
       const m=Math.floor(s/60),sec=Math.floor(s%60);
       return m>=60?Math.floor(m/60)+'h'+(m%60)+'m':m+'m'+sec+'s'; },
