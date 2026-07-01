@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.5.0] - 2026-06-24
+### Features
+- **Occupy GPU (社交预留)**: each GPU card gets an `occupy` button. Clicking it
+  prompts for a user name (pre-filled with the server's OS user) and launches a
+  tiny placeholder process pinned to that GPU whose command line reads
+  `Please reserve this GPU for <user>`. The process holds only a bare CUDA
+  context (~550 MB HBM, 0 % util) — just enough to appear in other people's
+  `nvidia-smi` so they don't grab the card. A `release` button stops it, and a
+  `🔒 <user>` badge shows on occupied cards
+  (`POST /api/occupy` / `POST /api/release` → `Scheduler.occupy_gpu` /
+  `release_gpu`; placeholder source in `occupy_worker.py`).
+### Design Rationale
+- The reservation message must show up in **both** `nvidia-smi` and our own
+  process table, both of which read `/proc/<pid>/cmdline`. Rather than depend on
+  `setproctitle` (not installed; a C extension), the worker is launched via
+  `bash -c 'exec -a "<message>" python3'` with its source piped on **stdin**, so
+  the process' only argv element — hence its whole cmdline — is exactly the
+  message. `CUDA_DEVICE_ORDER=PCI_BUS_ID` pins it to the clicked NVML index;
+  `PYTHONHOME=<base_prefix>` silences the fake-argv0 stdlib-path warning.
+- The CUDA context is created with raw `ctypes` against `libcuda.so.1` — no
+  torch/pycuda dependency — keeping HBM/util footprint minimal.
+- Occupy state is persisted in a dedicated `occupy` table and the placeholders
+  are launched detached (`setsid`), so they survive a server restart and are
+  re-adopted by PID exactly like running tasks.
+### Notes & Caveats
+- `occupy` is intentionally **decoupled** from the scheduler's `reserved_gpus`
+  gate: it is a *social* signal to other humans, not an orchestrator constraint.
+  To also stop the orchestrator itself from dispatching onto the card, use the
+  existing `evac` / reserve controls.
+- The placeholder costs a few hundred MB of HBM (the minimum for a CUDA
+  context); it cannot be literally zero.
+
 ## [0.4.0] - 2026-06-23
 ### Features
 - **Batch one-click start (一键启动)**: with tasks selected on the *active* tab, a

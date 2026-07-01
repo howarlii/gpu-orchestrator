@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import getpass
 import time
 from pathlib import Path
 
@@ -88,6 +89,7 @@ async def _monitor_loop() -> None:
         rev = scheduler.get_rev()
         if rev != _last_rev:
             msg["tasks"] = scheduler.list_tasks()
+            msg["occupy"] = scheduler.occupy_state()
             _last_rev = rev
         dead = []
         for ws in list(_clients):
@@ -143,6 +145,8 @@ async def ws_endpoint(ws: WebSocket) -> None:
             "tasks": scheduler.list_tasks(),
             "config": scheduler.get_config(),
             "dispatch": scheduler.dispatch_state,
+            "occupy": scheduler.occupy_state(),
+            "default_user": getpass.getuser(),
             "monitor_ok": monitor.ok,
             "monitor_err": monitor.err,
         })
@@ -187,6 +191,15 @@ class EvacIn(BaseModel):
     gpu: int
     reserve: bool = True
     kill: bool = True
+
+
+class OccupyIn(BaseModel):
+    gpu: int
+    user: str = ""
+
+
+class GpuIn(BaseModel):
+    gpu: int
 
 
 class RunNowIn(BaseModel):
@@ -290,3 +303,17 @@ async def evacuate(b: EvacIn):
     scheduler.evacuate_gpu(b.gpu, b.reserve, b.kill)
     return {"tasks": scheduler.list_tasks(),
             "config": scheduler.get_config()}
+
+
+@app.post("/api/occupy")
+async def occupy(b: OccupyIn):
+    """Launch a placeholder process so the GPU shows as reserved in nvidia-smi."""
+    scheduler.occupy_gpu(b.gpu, b.user)
+    return {"occupy": scheduler.occupy_state()}
+
+
+@app.post("/api/release")
+async def release(b: GpuIn):
+    """Stop the occupy placeholder on a GPU."""
+    scheduler.release_gpu(b.gpu)
+    return {"occupy": scheduler.occupy_state()}

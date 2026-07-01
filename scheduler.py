@@ -9,12 +9,15 @@ tracked in-memory; on restart, previously-running tasks are marked 'lost'.
 """
 from __future__ import annotations
 
+import getpass
 import json
 import os
 import re
+import shlex
 import signal
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -26,6 +29,9 @@ ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "orchestrator.db"
 LOG_DIR = ROOT / "logs"
 LOG_DIR.mkdir(exist_ok=True)
+OCCUPY_WORKER = ROOT / "occupy_worker.py"
+# template for the placeholder process' command line, shown in nvidia-smi
+OCCUPY_MSG = "Please reserve this GPU for {user}"
 
 ACTIVE = ("queued", "running")
 
@@ -42,6 +48,10 @@ class Scheduler:
         # tasks re-adopted after a restart: task_id -> pid (not our children,
         # so they can only be polled by PID existence, not waitpid()'d)
         self.orphans: dict[int, int] = {}
+        # GPU "occupy" placeholders: gpu_index -> Popen (our children) and
+        # gpu_index -> pid for ones re-adopted after a restart.
+        self.occupy_procs: dict[int, subprocess.Popen] = {}
+        self.occupy_orphans: dict[int, int] = {}
         # revision counter: bumped on every task/config mutation so the server
         # can avoid re-broadcasting the (heavy) task list when nothing changed.
         self.rev = 0
@@ -89,6 +99,13 @@ class Scheduler:
                     log_path TEXT
                 );
                 CREATE TABLE IF NOT EXISTS config (k TEXT PRIMARY KEY, v TEXT);
+                CREATE TABLE IF NOT EXISTS occupy (
+                    gpu INTEGER PRIMARY KEY,
+                    pid INTEGER,
+                    user TEXT,
+                    msg TEXT,
+                    started_at REAL
+                );
                 """
             )
             self.db.commit()
@@ -127,6 +144,14 @@ class Scheduler:
                     self.db.execute(
                         "UPDATE tasks SET status='lost', ended_at=? WHERE id=?",
                         (_now(), r["id"]))
+            # re-adopt still-alive occupy placeholders; drop dead rows
+            for r in self.db.execute(
+                    "SELECT gpu, pid, started_at FROM occupy").fetchall():
+                if r["pid"] and self._pid_alive(r["pid"], r["started_at"]):
+                    self.occupy_orphans[r["gpu"]] = r["pid"]
+                else:
+                    self.db.execute("DELETE FROM occupy WHERE gpu=?",
+                                    (r["gpu"],))
             self.db.commit()
 
     @staticmethod
@@ -329,6 +354,103 @@ class Scheduler:
             res = set(cfg["reserved_gpus"]) | {gpu}
             self.set_config(reserved_gpus=list(res))
 
+    # ---- GPU occupy (social reservation placeholder) -----------------------
+    def occupy_gpu(self, gpu: int, user: str = "") -> bool:
+        """Launch a tiny placeholder process that holds a CUDA context on
+        ``gpu`` and whose command line reads "Please reserve this GPU for
+        <user>", so other people see it in nvidia-smi. Almost no HBM, 0% util.
+
+        Idempotent: if the GPU is already occupied (alive), do nothing.
+        Returns True if a placeholder is now running on the GPU.
+        """
+        ngpu = self.monitor.count or 0
+        if gpu < 0 or gpu >= ngpu:
+            return False
+        user = (user or "").strip() or getpass.getuser()
+        with self.lock:
+            # already occupied and alive? leave it be
+            proc = self.occupy_procs.get(gpu)
+            if proc and proc.poll() is None:
+                return True
+            opid = self.occupy_orphans.get(gpu)
+            if opid and self._pid_alive(opid, None):
+                return True
+        msg = OCCUPY_MSG.format(user=user)
+        log_path = str(LOG_DIR / f"occupy_gpu{gpu}.log")
+        env = dict(os.environ)
+        # pin to the exact physical GPU the user clicked (NVML/nvidia-smi order)
+        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+        # exec -a gives python a fake argv[0], so it can't locate its stdlib;
+        # point it at the base prefix (the worker only needs the stdlib). This
+        # silences the "Could not find platform dependent libraries" warning.
+        env["PYTHONHOME"] = sys.base_prefix
+        # exec -a sets argv[0] to the message; the worker source is piped on
+        # stdin so the process' only argv element is the message itself.
+        bash_cmd = f"exec -a {shlex.quote(msg)} {shlex.quote(sys.executable)}"
+        try:
+            logf = open(log_path, "wb", buffering=0)
+            worker = open(OCCUPY_WORKER, "rb")
+            proc = subprocess.Popen(
+                ["bash", "-c", bash_cmd], env=env,
+                stdin=worker, stdout=logf, stderr=subprocess.STDOUT,
+                preexec_fn=os.setsid, cwd=str(ROOT))
+            worker.close()
+        except Exception:
+            return False
+        with self.lock:
+            self.occupy_procs[gpu] = proc
+            self.occupy_orphans.pop(gpu, None)
+            self.db.execute(
+                "INSERT INTO occupy(gpu, pid, user, msg, started_at) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(gpu) DO UPDATE SET "
+                "pid=excluded.pid, user=excluded.user, msg=excluded.msg, "
+                "started_at=excluded.started_at",
+                (gpu, proc.pid, user, msg, _now()))
+            self.db.commit()
+            self._bump()
+        return True
+
+    def release_gpu(self, gpu: int) -> None:
+        """Kill the occupy placeholder on ``gpu`` (if any) and forget it."""
+        with self.lock:
+            proc = self.occupy_procs.pop(gpu, None)
+            orphan_pid = self.occupy_orphans.pop(gpu, None)
+        # our own child: SIGTERM the group, then poll() to reap the zombie,
+        # escalating to SIGKILL if needed.
+        if proc and proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except Exception:
+                pass
+            for _ in range(20):
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.1)
+            if proc.poll() is None:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception:
+                    pass
+        # re-adopted placeholder (not our child): kill by PID, init reaps it.
+        if orphan_pid and self._pid_alive(orphan_pid, None):
+            try:
+                os.killpg(os.getpgid(orphan_pid), signal.SIGTERM)
+            except Exception:
+                pass
+        with self.lock:
+            self.db.execute("DELETE FROM occupy WHERE gpu=?", (gpu,))
+            self.db.commit()
+            self._bump()
+
+    def occupy_state(self) -> dict[str, dict]:
+        """gpu_index (as str, JSON-friendly) -> {user, msg, pid} for the UI."""
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT gpu, pid, user, msg FROM occupy").fetchall()
+        return {str(r["gpu"]): {"user": r["user"], "msg": r["msg"],
+                                "pid": r["pid"]} for r in rows}
+
     def run_now(self, tid: int, sample: dict) -> bool:
         """Force-launch a queued task immediately on the GPU(s) with the most
         free HBM, bypassing the per-GPU cap, HBM gate and dispatch cooldown.
@@ -485,6 +607,20 @@ class Scheduler:
                 self.db.execute(
                     "UPDATE tasks SET status='done', ended_at=? "
                     "WHERE id=? AND status='running'", (_now(), tid))
+                self.db.commit()
+                self._bump()
+            changed = True
+        # occupy placeholders that have exited (crashed or were killed) — drop
+        with self.lock:
+            occ = list(self.occupy_procs.items())
+            occ_orphans = list(self.occupy_orphans.items())
+        gone: list[int] = [g for g, p in occ if p.poll() is not None]
+        gone += [g for g, pid in occ_orphans if not self._pid_alive(pid, None)]
+        for gpu in gone:
+            with self.lock:
+                self.occupy_procs.pop(gpu, None)
+                self.occupy_orphans.pop(gpu, None)
+                self.db.execute("DELETE FROM occupy WHERE gpu=?", (gpu,))
                 self.db.commit()
                 self._bump()
             changed = True

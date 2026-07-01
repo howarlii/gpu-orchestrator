@@ -119,23 +119,48 @@
       <div class="card" :class="{reserved: config.reserved_gpus.includes(g.index)}">
         <div class="ghead">
           <div><span class="gidx" x-text="'#'+g.index"></span>
-            <span class="gname" x-text="g.name"></span></div>
+            <span class="gname" x-text="g.name"></span>
+            <span x-show="occupy[g.index]" class="st killed" style="margin-left:6px"
+              :title="occupy[g.index]?occupy[g.index].msg:''"
+              x-text="occupy[g.index]?('🔒 '+occupy[g.index].user):''"></span></div>
           <div>
-            <template x-if="evacFor!==g.index">
-              <span>
-                <button class="sm warn" @click="evacFor=g.index"
-                  title="reserve this GPU (optionally kill its tasks)">evac</button>
-                <button class="sm" x-show="config.reserved_gpus.includes(g.index)"
-                  @click="unreserve(g.index)" title="allow scheduling again">free</button>
+            <!-- occupy: inline user input -->
+            <template x-if="occFor===g.index">
+              <span class="row" style="gap:4px">
+                <input x-model="occUser" placeholder="user" style="width:90px"
+                  @keydown.enter="doOccupy(g.index)" @keydown.escape="occFor=null">
+                <button class="sm" style="color:var(--green);border-color:var(--green)"
+                  @click="doOccupy(g.index)"
+                  title="占用：在该卡跑一个几乎不占显存的占位进程，nvidia-smi 里显示为你预留">ok</button>
+                <button class="sm" @click="occFor=null">✕</button>
               </span>
             </template>
-            <template x-if="evacFor===g.index">
+            <!-- evac: inline confirm -->
+            <template x-if="occFor!==g.index && evacFor===g.index">
               <span class="row" style="gap:4px">
                 <button class="sm danger" @click="evacuate(g.index,true)"
                   title="kill+requeue all tasks here, then reserve">kill all</button>
                 <button class="sm warn" @click="evacuate(g.index,false)"
                   title="just stop new tasks; let running ones finish">no new</button>
                 <button class="sm" @click="evacFor=null">✕</button>
+              </span>
+            </template>
+            <!-- default actions -->
+            <template x-if="occFor!==g.index && evacFor!==g.index">
+              <span class="row" style="gap:4px">
+                <template x-if="occupy[g.index]">
+                  <button class="sm warn" @click="release(g.index)"
+                    :title="'release reservation ('+(occupy[g.index]?occupy[g.index].user:'')+')'"
+                    >release</button>
+                </template>
+                <template x-if="!occupy[g.index]">
+                  <button class="sm" @click="startOccupy(g.index)"
+                    title="占用：跑一个几乎不占显存的占位进程，让别人在 nvidia-smi 看到这张卡已被预留">occupy</button>
+                </template>
+                <button class="sm warn" @click="evacFor=g.index"
+                  title="reserve this GPU (optionally kill its tasks)">evac</button>
+                <button class="sm" x-show="config.reserved_gpus.includes(g.index)"
+                  @click="unreserve(g.index)" title="allow scheduling again">free</button>
               </span>
             </template>
           </div>
@@ -512,6 +537,7 @@ function app(){
     form:{command:'',name:'',priority:0,num_gpus:1,min_free_hbm_gb:'',perLine:false},
     selected:[], queueTab:'active', filter:'', statusEdit:null,
     evacFor:null, _procMeta:{},
+    occupy:{}, defaultUser:'', occFor:null, occUser:'',
     cmdTip:null, usageTip:null, copiedId:null, anchorId:null,
     sortKey:'id', sortDir:1,
     nowTs:Date.now()/1000, clockOffset:0,
@@ -548,6 +574,7 @@ function app(){
         if(m.sample&&m.sample.ts){ this.clockOffset=m.sample.ts-Date.now()/1000;
           this.nowTs=Date.now()/1000+this.clockOffset; }
         if(m.dispatch)this.dispatch=m.dispatch;
+        this.occupy=m.occupy||{}; this.defaultUser=m.default_user||'';
         this.mergeProcMeta(m.sample);
         this.gpus=m.sample.gpus||[];
         this.sys=m.sample.sys||{};
@@ -567,6 +594,7 @@ function app(){
         if(m.sample&&m.sample.ts){ this.clockOffset=m.sample.ts-Date.now()/1000; }
         if(m.usage) this.usage=m.usage;
         if(m.tasks) this.tasks=m.tasks;
+        if(m.occupy) this.occupy=m.occupy;
         if(m.dispatch) this.dispatch=m.dispatch;
         this.buildPidMap();
         this.$nextTick(()=>{
@@ -642,7 +670,8 @@ function app(){
       const r=await fetch(url,{method,headers:{'Content-Type':'application/json'},
         body:body?JSON.stringify(body):null});
       const d=await r.json(); if(d.tasks)this.tasks=d.tasks;
-      if(d.config)this.config=d.config; return d;
+      if(d.config)this.config=d.config; if(d.occupy)this.occupy=d.occupy;
+      return d;
     },
     async addTask(){
       const f=this.form;
@@ -718,6 +747,13 @@ function app(){
       await this.api('/api/evacuate','POST',{gpu,reserve:true,kill}); },
     async unreserve(gpu){ const r=this.config.reserved_gpus.filter(x=>x!==gpu);
       await this.api('/api/config','POST',{reserved_gpus:r}); },
+    // occupy: run a tiny placeholder so nvidia-smi shows the GPU as reserved
+    startOccupy(gpu){ this.evacFor=null; this.occFor=gpu;
+      this.occUser=this.defaultUser||''; },
+    async doOccupy(gpu){ this.occFor=null;
+      await this.api('/api/occupy','POST',{gpu,user:this.occUser||''}); },
+    async release(gpu){
+      await this.api('/api/release','POST',{gpu}); },
 
     // sorting
     sortBy(k){ if(this.sortKey===k)this.sortDir*=-1; else{this.sortKey=k;this.sortDir=1;} },
