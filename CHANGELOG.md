@@ -1,5 +1,58 @@
 # Changelog
 
+## [0.6.0] - 2026-07-01
+### Features
+- **暂停 / 恢复 (pause / resume)**: a new `paused` task state. Pausing a
+  **running** task kills its process but parks it in `paused` instead of
+  requeuing — unlike `requeue`, the scheduler (which only dispatches `queued`)
+  will **not** auto-restart it. A **queued** task can also be paused (pulled out
+  of the dispatch queue). `resume` moves it back to `queued`, giving a
+  `queued → running → paused → queued` cycle. Row buttons: ⏸ on running/queued,
+  ▶ (green) to resume on paused (`POST /api/tasks/pause` / `/resume` →
+  `Scheduler.pause_tasks` / `resume_tasks`).
+- **拖拽调整运行顺序 (drag-and-drop queue reordering)**: the active tab now
+  defaults to a **run-order** view (`≡ 运行顺序` toggle) that mirrors what the
+  scheduler actually dispatches (`priority DESC, id ASC`). Queued rows show a
+  drag grip and can be dragged to reorder; on drop the new order is persisted by
+  rewriting priorities (`POST /api/tasks/reorder` → `Scheduler.reorder_tasks`).
+- **Finished tab bulk requeue**: selecting finished tasks now shows a
+  `↻ requeue (N)` button to re-queue them in bulk (separate from
+  `↻ retry all failed`, which is unconditional over all failed/lost tasks).
+### Bug Fixes
+- **Row action buttons silently did nothing** (requeue / run now / delete, and
+  bulk requeue/delete). Root cause: the Alpine component had both a data
+  property `dispatch` (dispatch-status display) and a method `dispatch(action,
+  ids)`; every WebSocket tick ran `this.dispatch = m.dispatch`, clobbering the
+  method with the status object so `this.dispatch(...)` threw. The method was
+  renamed to `runAction`.
+- **Host network traffic was inflated several-fold by a local proxy**: the
+  system panel summed `psutil.net_io_counters()` across *all* interfaces
+  including loopback (`lo`). A local proxy relays traffic over `127.0.0.1`,
+  where every byte is counted on both `lo`'s sent and recv (and again on the
+  physical NIC), so `lo` alone accounted for ~95 % of the displayed upload.
+  Net rates now sum only non-loopback interfaces (`pernic=True`, skip `lo*`),
+  reflecting true external throughput.
+- **Pin top / priority changes were invisible**: the backend bumped priority
+  correctly but the active tab was hard-sorted by `id`, so rows never moved. The
+  active tab now defaults to run-order, so pin/reorder are reflected immediately.
+### UI
+- **Scheduler settings regrouped as fieldset cards**: below the `Scheduler`
+  heading, the knobs are split into three bordered cards whose titles sit as
+  colour-coded legends on the top border — **调度** (blue: max concurrent,
+  dispatch cooldown), **CPU** (green: min free RAM), **GPU** (purple: max
+  tasks/GPU, min free HBM, max GPU util %). The cards flex-wrap responsively so
+  related settings stay visually boxed together.
+- **Host DISK/NET readouts no longer jitter**: rate values are fixed-width,
+  right-aligned with tabular numerals, so a changing disk rate can't shove the
+  net figures sideways (and vice-versa).
+### Notes & Caveats
+- `pause` on a running task **terminates** the process (SIGTERM→SIGKILL like
+  requeue); resuming re-launches from scratch (new run/log), it is not a
+  process-level SIGSTOP freeze.
+- Drag reordering only applies in the active tab's `≡ 运行顺序` mode and only to
+  `queued` rows; clicking a column header switches to that column's sort and
+  disables dragging until you toggle run-order back on.
+
 ## [0.5.0] - 2026-06-24
 ### Features
 - **Occupy GPU (社交预留)**: each GPU card gets an `occupy` button. Clicking it

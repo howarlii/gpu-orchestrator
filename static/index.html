@@ -35,6 +35,30 @@
   .sysitem{display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--dim)}
   .sysitem b{color:var(--fg);font-weight:600}
   .sysitem .bar.wide{width:150px;height:8px;margin-top:0}
+  /* fixed-width, right-aligned, tabular numerals so a changing disk rate can't
+     shove the net readout sideways (and vice-versa) */
+  .sysitem b.rate{display:inline-block;min-width:62px;text-align:right;
+    font-variant-numeric:tabular-nums;font-feature-settings:"tnum"}
+  .sysitem.io{min-width:190px}
+  /* scheduler config: each group (调度 / CPU / GPU) is a fieldset card whose
+     title sits as a legend on the top border, colour-coded by concern */
+  .cfggroups{display:flex;flex-wrap:wrap;gap:10px;margin-top:12px;align-items:flex-start}
+  .cfgcard{position:relative;flex:0 1 auto;min-width:0;
+    border:1px solid var(--border);border-radius:8px;padding:13px 12px 11px}
+  .cfgcard>.cfgtitle{position:absolute;top:-8px;left:11px;background:var(--panel);
+    padding:0 7px;font-size:10px;font-weight:700;letter-spacing:.09em;
+    text-transform:uppercase}
+  .cfgcard.sched{border-color:rgba(88,166,255,.35)}
+  .cfgcard.sched>.cfgtitle{color:var(--blue)}
+  .cfgcard.cpu{border-color:rgba(63,185,80,.35)}
+  .cfgcard.cpu>.cfgtitle{color:var(--green)}
+  .cfgcard.gpu{border-color:rgba(188,140,255,.35)}
+  .cfgcard.gpu>.cfgtitle{color:var(--purple)}
+  /* fields laid out horizontally inside each card */
+  .cfgcard>.cfgbody{display:flex;flex-wrap:wrap;gap:9px 14px;align-items:center}
+  .fld{display:flex;align-items:center;gap:6px;color:var(--dim);
+    font-size:11px;white-space:nowrap}
+  .fld input[type=number]{width:52px;padding:4px 6px}
   .charts{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:6px 0 2px}
   .chart{min-width:0}
   .chart .u-title{font-size:10px;color:var(--dim);padding:0;margin:0 0 1px}
@@ -89,6 +113,11 @@
   .st.done{background:rgba(139,148,158,.15);color:var(--dim)}
   .st.failed,.st.lost{background:rgba(248,81,73,.15);color:var(--red)}
   .st.killed{background:rgba(210,153,34,.15);color:var(--yellow)}
+  .st.paused{background:rgba(210,153,34,.18);color:var(--yellow)}
+  .grip{cursor:grab;color:var(--dim);margin-right:5px;user-select:none}
+  tr[draggable="true"]{cursor:grab}
+  tr.drag{opacity:.45}
+  tr.dropto td{box-shadow:inset 0 2px 0 0 var(--green)}
   .modal{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;
     align-items:center;justify-content:center;z-index:50}
   .modal .box{background:var(--panel);border:1px solid var(--border);border-radius:8px;
@@ -191,12 +220,12 @@
     <div class="sysitem"><span class="label">RAM</span>
       <div class="bar wide"><i :style="`width:${ramPct()}%;background:var(--mem)`"></i></div>
       <b x-text="fmtGiB(sys.ram_used)+' / '+fmtGiB(sys.ram_total)"></b></div>
-    <div class="sysitem"><span class="label">DISK</span>
-      <b style="color:var(--green)" x-text="'R '+fmtRate(sys.disk_r)"></b>
-      <b style="color:var(--blue)" x-text="'W '+fmtRate(sys.disk_w)"></b></div>
-    <div class="sysitem"><span class="label">NET</span>
-      <b style="color:var(--green)" x-text="'↑'+fmtRate(sys.net_u)"></b>
-      <b style="color:var(--blue)" x-text="'↓'+fmtRate(sys.net_d)"></b></div>
+    <div class="sysitem io"><span class="label">DISK</span>
+      <b class="rate" style="color:var(--green)" x-text="'R '+fmtRate(sys.disk_r)"></b>
+      <b class="rate" style="color:var(--blue)" x-text="'W '+fmtRate(sys.disk_w)"></b></div>
+    <div class="sysitem io"><span class="label">NET</span>
+      <b class="rate" style="color:var(--green)" x-text="'↑'+fmtRate(sys.net_u)"></b>
+      <b class="rate" style="color:var(--blue)" x-text="'↓'+fmtRate(sys.net_d)"></b></div>
   </div>
 
   <!-- Unified process table (nvitop-style) -->
@@ -230,26 +259,47 @@
 
   <!-- Controls -->
   <div class="controls">
-    <div class="row">
-      <strong>Scheduler</strong>
-      <span class="label">max tasks/GPU</span>
-      <input type="number" min="1" x-model.number="config.max_tasks_per_gpu"
-        @change="saveConfig()">
-      <span class="label">min free HBM (GB)</span>
-      <input type="number" min="0" step="1" x-model.number="config.min_free_hbm_gb"
-        @change="saveConfig()">
-      <span class="label" title="只有空闲 RAM 高于此值才继续分配 (0=关闭)">min free RAM (GB)</span>
-      <input type="number" min="0" step="1" x-model.number="config.min_free_ram_gb"
-        @change="saveConfig()">
-      <span class="label" title="同时运行的任务总数上限 (0=停止派遣新任务)">max concurrent</span>
-      <input type="number" min="0" step="1" x-model.number="config.max_concurrent_tasks"
-        @change="saveConfig()">
-      <span class="label" title="任务开始占用 GPU 后，等待这么多秒再分配下一个，避免一口气塞太多 (0=关闭)">dispatch cooldown (s)</span>
-      <input type="number" min="0" step="5" x-model.number="config.dispatch_cooldown_s"
-        @change="saveConfig()">
-      <span class="label" title="某 GPU 最近5分钟平均使用率达到此值后，停止再往该卡派发新任务，避免满负载的卡被塞入过多任务 (0=关闭)">max GPU util % (5m)</span>
-      <input type="number" min="0" max="100" step="5" x-model.number="config.max_gpu_util_pct"
-        @change="saveConfig()">
+    <div class="row"><strong>Scheduler</strong></div>
+    <div class="cfggroups">
+      <div class="cfgcard sched">
+        <div class="cfgtitle">调度</div>
+        <div class="cfgbody">
+          <label class="fld" title="同时运行的任务总数上限 (0=停止派遣新任务)">
+            <span>max concurrent</span>
+            <input type="number" min="0" step="1"
+              x-model.number="config.max_concurrent_tasks" @change="saveConfig()"></label>
+          <label class="fld" title="任务开始占用 GPU 后，等待这么多秒再分配下一个，避免一口气塞太多 (0=关闭)">
+            <span>dispatch cooldown (s)</span>
+            <input type="number" min="0" step="5"
+              x-model.number="config.dispatch_cooldown_s" @change="saveConfig()"></label>
+        </div>
+      </div>
+      <div class="cfgcard cpu">
+        <div class="cfgtitle">CPU</div>
+        <div class="cfgbody">
+          <label class="fld" title="只有空闲 RAM 高于此值才继续分配 (0=关闭)">
+            <span>min free RAM (GB)</span>
+            <input type="number" min="0" step="1"
+              x-model.number="config.min_free_ram_gb" @change="saveConfig()"></label>
+        </div>
+      </div>
+      <div class="cfgcard gpu">
+        <div class="cfgtitle">GPU</div>
+        <div class="cfgbody">
+          <label class="fld" title="每张 GPU 上同时运行的任务数上限">
+            <span>max tasks/GPU</span>
+            <input type="number" min="1"
+              x-model.number="config.max_tasks_per_gpu" @change="saveConfig()"></label>
+          <label class="fld" title="GPU 剩余显存高于此值才往上派发任务">
+            <span>min free HBM (GB)</span>
+            <input type="number" min="0" step="1"
+              x-model.number="config.min_free_hbm_gb" @change="saveConfig()"></label>
+          <label class="fld" title="某 GPU 最近5分钟平均使用率达到此值后，停止再往该卡派发新任务，避免满负载的卡被塞入过多任务 (0=关闭)">
+            <span>max GPU util % (5m)</span>
+            <input type="number" min="0" max="100" step="5"
+              x-model.number="config.max_gpu_util_pct" @change="saveConfig()"></label>
+        </div>
+      </div>
     </div>
     <div class="row" x-show="dispatch.reason">
       <span class="label">dispatch</span>
@@ -300,6 +350,10 @@
       <button class="sm warn" x-show="queueTab==='finished'" :disabled="!failedCount()"
         @click="retryFailed()"
         x-text="'↻ retry all failed ('+failedCount()+')'"></button>
+      <button class="sm" x-show="queueTab==='active'"
+        :style="sortKey==='queue'?'color:var(--green);border-color:var(--green)':''"
+        @click="sortKey='queue'"
+        title="按实际运行顺序排列；此模式下可拖拽排队任务调整优先级">≡ 运行顺序</button>
       <span class="sp"></span>
       <template x-if="queueTab==='active'">
         <span class="row" style="gap:6px" x-show="selected.length">
@@ -311,9 +365,13 @@
           <button class="sm warn" @click="bulk('requeue')">requeue</button>
         </span>
       </template>
-      <button class="sm warn" x-show="queueTab==='finished' && selected.length"
-        @click="bulk('requeue')"
-        x-text="'↻ requeue ('+selected.length+')'"></button>
+      <template x-if="queueTab==='finished'">
+        <span class="row" style="gap:6px" x-show="selected.length">
+          <button class="sm warn" @click="bulk('requeue')"
+            title="把选中的已结束任务重新放回队列（重跑）"
+            x-text="'↻ requeue ('+selected.length+')'"></button>
+        </span>
+      </template>
       <button class="sm danger" x-show="selected.length"
         @click="bulk('delete')">delete</button>
     </div>
@@ -330,8 +388,13 @@
       </tr></thead>
       <tbody>
         <template x-for="t in sortedTasks()" :key="t.id">
-          <tr :class="{sel:selected.includes(t.id)}" @click="rowClick(t,$event)">
-            <td x-text="t.id"></td>
+          <tr :class="{sel:selected.includes(t.id),drag:dragId===t.id,dropto:dragOverId===t.id}"
+            :draggable="canDrag(t)"
+            @dragstart="dragStart(t,$event)" @dragover="dragOver(t,$event)"
+            @drop.prevent="drop(t)" @dragend="dragEnd()"
+            @click="rowClick(t,$event)">
+            <td><span class="grip" x-show="canDrag(t)"
+              title="拖拽调整运行顺序">⠿</span><span x-text="t.id"></span></td>
             <td class="nm"><div x-text="t.name" :title="t.name"></div></td>
             <td><button class="sm" @click.stop="copyCmd(t)"
               @mouseenter="showCmdTip($event,t.command)" @mousemove="moveCmdTip($event)"
@@ -366,9 +429,20 @@
                   @click.stop="one('run_now',t.id)"
                   title="run now：立刻在空闲显存最多的 GPU 上运行">▶</button>
               </template>
-              <template x-if="t.status!=='queued'">
+              <template x-if="t.status==='running' || t.status==='queued'">
+                <button class="sm" @click.stop="one('pause',t.id)"
+                  :title="t.status==='running'
+                    ? '暂停：杀掉进程但不重新入队（不会被调度器自动重启）'
+                    : '暂停：从队列移出，调度器不再派发它（可随时恢复）'">⏸</button>
+              </template>
+              <template x-if="t.status==='paused'">
+                <button class="sm" style="color:var(--green);border-color:var(--green)"
+                  @click.stop="one('resume',t.id)"
+                  title="恢复：放回队列等待调度">▶</button>
+              </template>
+              <template x-if="t.status!=='queued' && t.status!=='paused'">
                 <button class="sm warn" @click.stop="one('requeue',t.id)"
-                  title="kill + requeue">↻</button>
+                  title="kill + requeue（立即重跑）">↻</button>
               </template>
               <button class="sm danger" @click.stop="one('delete',t.id)">✕</button>
             </td>
@@ -539,7 +613,7 @@ function app(){
     evacFor:null, _procMeta:{},
     occupy:{}, defaultUser:'', occFor:null, occUser:'',
     cmdTip:null, usageTip:null, copiedId:null, anchorId:null,
-    sortKey:'id', sortDir:1,
+    sortKey:'queue', sortDir:1, dragId:null, dragOverId:null,
     nowTs:Date.now()/1000, clockOffset:0,
     logTask:null, logText:'', logFollow:true, logCopied:false, _logTimer:null,
     logRuns:[], logRun:null, logPath:'',
@@ -688,12 +762,14 @@ function app(){
       }
       this.form.command='';this.form.name='';
     },
-    one(action,id){ this.act(action,[id]); },
-    bulk(action){ if(this.selected.length)this.act(action,[...this.selected]); },
-    async act(action,ids){
+    one(action,id){ this.runAction(action,[id]); },
+    bulk(action){ if(this.selected.length)this.runAction(action,[...this.selected]); },
+    async runAction(action,ids){
       if(action==='delete'){ if(!confirm('delete '+ids.length+' task(s)?'))return;
         await this.api('/api/tasks','DELETE',{ids}); }
       else if(action==='requeue'){ await this.api('/api/tasks/requeue','POST',{ids}); }
+      else if(action==='pause'){ await this.api('/api/tasks/pause','POST',{ids}); }
+      else if(action==='resume'){ await this.api('/api/tasks/resume','POST',{ids}); }
       else if(action==='run_now'){ await this.api('/api/tasks/run_now','POST',{id:ids[0]}); }
       this.selected=this.selected.filter(x=>!ids.includes(x));
     },
@@ -760,7 +836,7 @@ function app(){
     switchTab(tab){ if(this.queueTab===tab)return; this.queueTab=tab; this.selected=[];
       // default ordering per tab: finished → most recently ended first
       if(tab==='finished'){ this.sortKey='ended_at'; this.sortDir=-1; }
-      else { this.sortKey='id'; this.sortDir=1; } },
+      else { this.sortKey='queue'; this.sortDir=1; } },
     // running-task resource tooltip (CPU / GPU usage of the task itself)
     usageText(t){
       const u=this.usage[t.id];
@@ -798,7 +874,7 @@ function app(){
       await this.clip(this.logPath);
       this.logCopied=true; setTimeout(()=>{ this.logCopied=false; },1200);
     },
-    isActive(t){ return t.status==='running'||t.status==='queued'; },
+    isActive(t){ return t.status==='running'||t.status==='queued'||t.status==='paused'; },
     inTab(t){ return this.queueTab==='active' ? this.isActive(t) : !this.isActive(t); },
     tabCount(tab){ return this.tasks.filter(t=>
       (tab==='active')===this.isActive(t)).length; },
@@ -813,6 +889,10 @@ function app(){
       return q.split(/\s+/).every(term=>hay.includes(term));
     },
     sortedTasks(){
+      const base=this.tasks.filter(t=>this.inTab(t)&&this.matchFilter(t));
+      // queue mode: keep backend run-order (running first, then priority DESC,
+      // id ASC) — this is what the scheduler actually dispatches by.
+      if(this.sortKey==='queue') return base;
       const k=this.sortKey,d=this.sortDir;
       const val=(t)=>{
         if(k==='runtime')return this._rt(t);
@@ -820,11 +900,31 @@ function app(){
         if(k==='gpu_ids')return t.gpu_ids||'';
         return t[k]??0;
       };
-      return this.tasks.filter(t=>this.inTab(t)&&this.matchFilter(t)).sort((a,b)=>{
+      return base.sort((a,b)=>{
         const x=val(a),y=val(b);
         if(x<y)return -1*d; if(x>y)return 1*d; return (a.id-b.id)*d;
       });
     },
+    // drag-and-drop queue reordering (only in active tab + queue-order mode,
+    // only for queued tasks). On drop, POST the new queued-id order; the
+    // backend rewrites priorities so the dispatch loop follows it.
+    canDrag(t){ return this.queueTab==='active' && this.sortKey==='queue'
+      && t.status==='queued'; },
+    dragStart(t,e){ if(!this.canDrag(t)){ e.preventDefault(); return; }
+      this.dragId=t.id; e.dataTransfer.effectAllowed='move';
+      try{ e.dataTransfer.setData('text/plain',String(t.id)); }catch(_){}
+    },
+    dragOver(t,e){ if(this.dragId==null||t.status!=='queued')return;
+      e.preventDefault(); e.dataTransfer.dropEffect='move'; this.dragOverId=t.id; },
+    async drop(t){ const src=this.dragId; this.dragId=null; this.dragOverId=null;
+      if(src==null||t.status!=='queued'||t.id===src)return;
+      const q=this.sortedTasks().filter(x=>x.status==='queued').map(x=>x.id);
+      const from=q.indexOf(src), to=q.indexOf(t.id);
+      if(from<0||to<0)return;
+      q.splice(from,1); q.splice(to,0,src);
+      await this.api('/api/tasks/reorder','POST',{ids:q});
+    },
+    dragEnd(){ this.dragId=null; this.dragOverId=null; },
     _rt(t){ if(!t.started_at)return 0;
       return Math.max(0,(t.ended_at||this.nowTs)-t.started_at); },
     runtime(t){ const s=this._rt(t); if(!s)return '-';

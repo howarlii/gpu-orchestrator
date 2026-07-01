@@ -246,6 +246,20 @@ async def requeue(b: IdsIn):
     return {"tasks": scheduler.list_tasks()}
 
 
+@app.post("/api/tasks/pause")
+async def pause(b: IdsIn):
+    """暂停: kill running/queued task and park it (won't auto-restart)."""
+    scheduler.pause_tasks(b.ids)
+    return {"tasks": scheduler.list_tasks()}
+
+
+@app.post("/api/tasks/resume")
+async def resume(b: IdsIn):
+    """恢复: paused -> queued."""
+    scheduler.resume_tasks(b.ids)
+    return {"tasks": scheduler.list_tasks()}
+
+
 @app.post("/api/tasks/retry_failed")
 async def retry_failed():
     scheduler.retry_failed()
@@ -269,6 +283,13 @@ async def start_tasks(b: IdsIn):
 async def pin_tasks(b: IdsIn):
     """置顶: bump selected queued tasks to the top of the queue."""
     scheduler.pin_tasks(b.ids)
+    return {"tasks": scheduler.list_tasks()}
+
+
+@app.post("/api/tasks/reorder")
+async def reorder_tasks(b: IdsIn):
+    """手动拖拽排序: `ids` is the queued tasks in desired run order (first=next)."""
+    scheduler.reorder_tasks(b.ids)
     return {"tasks": scheduler.list_tasks()}
 
 

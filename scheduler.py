@@ -277,6 +277,34 @@ class Scheduler:
         self.requeue_tasks(ids)
         return ids
 
+    def pause_tasks(self, ids: list[int]) -> None:
+        """暂停: kill a running task's process but park it in 'paused' instead of
+        requeuing. The dispatch loop only picks 'queued', so a paused task will
+        NOT auto-restart — unlike requeue, which kills then immediately re-runs.
+        Also works on a 'queued' task (park it before it ever starts)."""
+        for tid in ids:
+            self._kill(tid, status="paused")
+        with self.lock:
+            for tid in ids:
+                self.db.execute(
+                    "UPDATE tasks SET status='paused', gpu_ids='', pid=NULL "
+                    "WHERE id=? AND status IN ('running', 'queued', 'paused')",
+                    (tid,))
+            self.db.commit()
+            self._bump()
+
+    def resume_tasks(self, ids: list[int]) -> None:
+        """恢复: move paused tasks back into the queue so the scheduler can
+        dispatch them again (paused -> queued)."""
+        with self.lock:
+            for tid in ids:
+                self.db.execute(
+                    "UPDATE tasks SET status='queued', gpu_ids='', pid=NULL, "
+                    "started_at=NULL, ended_at=NULL, exit_code=NULL "
+                    "WHERE id=? AND status='paused'", (tid,))
+            self.db.commit()
+            self._bump()
+
     # ---- process control ----------------------------------------------------
     def _kill(self, tid: int, status: str) -> None:
         with self.lock:
@@ -486,6 +514,26 @@ class Scheduler:
                 self.db.execute(
                     "UPDATE tasks SET priority=? WHERE id=? AND status='queued'",
                     (top, tid))
+            self.db.commit()
+            self._bump()
+
+    def reorder_tasks(self, ordered_ids: list[int]) -> None:
+        """手动排序: set explicit run order for queued tasks — the first id in
+        ``ordered_ids`` runs first. Priorities are rewritten as N, N-1, … 1 so
+        the dispatch loop's ``ORDER BY priority DESC, id ASC`` reproduces the
+        exact given order. Non-queued / unknown ids are ignored; newly added
+        tasks (priority 0) naturally fall to the bottom of the queue."""
+        if not ordered_ids:
+            return
+        with self.lock:
+            queued = {r["id"] for r in self.db.execute(
+                "SELECT id FROM tasks WHERE status='queued'").fetchall()}
+            seq = [tid for tid in ordered_ids if tid in queued]
+            n = len(seq)
+            for i, tid in enumerate(seq):
+                self.db.execute(
+                    "UPDATE tasks SET priority=? WHERE id=? AND status='queued'",
+                    (n - i, tid))
             self.db.commit()
             self._bump()
 

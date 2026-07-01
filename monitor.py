@@ -135,18 +135,27 @@ class GpuMonitor:
             out["ram_used"] = out["ram_total"] = None
         try:
             d = psutil.disk_io_counters()
-            n = psutil.net_io_counters()
+            # Sum only real (non-loopback) NICs. The default aggregate counter
+            # includes `lo`, where a local proxy's relayed traffic is counted on
+            # BOTH sent and recv (and again on the physical NIC), inflating the
+            # host's apparent throughput several-fold. Excluding loopback gives
+            # the true external network rate.
+            per = psutil.net_io_counters(pernic=True)
+            ns = sum(s.bytes_sent for name, s in per.items()
+                     if not name.startswith("lo"))
+            nr = sum(s.bytes_recv for name, s in per.items()
+                     if not name.startswith("lo"))
             prev = self._prev_io
             dt = (ts - prev["ts"]) if prev else 0.0
             if prev and dt > 0:
                 out["disk_r"] = max(0.0, (d.read_bytes - prev["dr"]) / dt)
                 out["disk_w"] = max(0.0, (d.write_bytes - prev["dw"]) / dt)
-                out["net_u"] = max(0.0, (n.bytes_sent - prev["ns"]) / dt)
-                out["net_d"] = max(0.0, (n.bytes_recv - prev["nr"]) / dt)
+                out["net_u"] = max(0.0, (ns - prev["ns"]) / dt)
+                out["net_d"] = max(0.0, (nr - prev["nr"]) / dt)
             else:
                 out["disk_r"] = out["disk_w"] = out["net_u"] = out["net_d"] = 0.0
             self._prev_io = {"ts": ts, "dr": d.read_bytes, "dw": d.write_bytes,
-                             "ns": n.bytes_sent, "nr": n.bytes_recv}
+                             "ns": ns, "nr": nr}
         except Exception:
             out["disk_r"] = out["disk_w"] = out["net_u"] = out["net_d"] = None
         return out
