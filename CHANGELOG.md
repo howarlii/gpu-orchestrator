@@ -4,6 +4,7 @@
 ### Features
 - A single-GPU task can declare several candidate physical GPUs and optional per-GPU `GPU=ARGS` suffixes for paired external resources such as GDS/NVMe paths. The scheduler runs the task exactly once on one eligible candidate and appends only that GPU's args. The candidate map persists through requeue and otherwise follows the existing scheduler gates. The Web form and `octl add --gpu-ids 0,2 --gpu-arg '0=...'` expose the feature.
 - Task processes now set `CUDA_DEVICE_ORDER=PCI_BUS_ID`, keeping orchestrator GPU indices aligned with the physical order shown by NVML / `nvidia-smi`.
+- Tasks can declare `estimated_dram_gb` (`est DRAM` in the Web UI, `--dram GB` in `octl`). Normal scheduling, `run now`, and batch force-start keep the task queued whenever its estimate exceeds the host's current available RAM. Candidate/selected GPU information and estimated DRAM are visible directly in the queue table.
 
 ## [0.6.0] - 2026-07-01
 ### Features

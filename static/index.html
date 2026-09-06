@@ -322,6 +322,10 @@
         <span class="label">candidate GPUs</span>
         <input placeholder="auto / 0,2" x-model="form.target_gpu_ids"
           style="width:86px" title="从这些物理 GPU 中择一运行；留空则保持原有自动调度">
+        <span class="label">est DRAM</span>
+        <input type="number" min="0" step="1" placeholder="GB"
+          x-model="form.estimated_dram_gb" style="width:60px"
+          title="任务预计占用的 DRAM；当前可用 RAM 低于此值时不启动">
         <span class="label">min HBM</span>
         <input type="number" min="0" placeholder="def" x-model="form.min_free_hbm_gb" style="width:60px">
       </div>
@@ -392,6 +396,7 @@
         <th @click="sortBy('status')">status</th>
         <th @click="sortBy('priority')">prio</th>
         <th @click="sortBy('gpu_ids')">gpu/candidates</th>
+        <th @click="sortBy('estimated_dram_gb')">est DRAM</th>
         <th @click="sortBy('runtime')">runtime</th>
         <th>actions</th>
       </tr></thead>
@@ -429,7 +434,8 @@
               </template>
             </td>
             <td x-text="t.priority"></td>
-            <td x-text="taskGpuText(t)"></td>
+            <td x-text="taskGpuText(t)" :title="taskGpuArgsText(t)"></td>
+            <td x-text="t.estimated_dram_gb==null?'-':t.estimated_dram_gb+'G'"></td>
             <td x-text="runtime(t)"></td>
             <td>
               <button class="sm" @click.stop="showLog(t)">log</button>
@@ -618,7 +624,7 @@ function app(){
       min_free_ram_gb:0,max_concurrent_tasks:0,dispatch_cooldown_s:0,
       max_gpu_util_pct:0,paused:false},
     form:{command:'',name:'',priority:0,num_gpus:1,target_gpu_ids:'',gpu_args:'',
-      min_free_hbm_gb:'',perLine:false},
+      estimated_dram_gb:'',min_free_hbm_gb:'',perLine:false},
     selected:[], queueTab:'active', filter:'', statusEdit:null,
     evacFor:null, _procMeta:{},
     occupy:{}, defaultUser:'', occFor:null, occUser:'',
@@ -758,6 +764,7 @@ function app(){
         return {_error:true}; }
       if(d.tasks)this.tasks=d.tasks;
       if(d.config)this.config=d.config; if(d.occupy)this.occupy=d.occupy;
+      if(d.dispatch)this.dispatch=d.dispatch;
       return d;
     },
     async addTask(){
@@ -804,6 +811,8 @@ function app(){
           priority:f.priority||0,num_gpus:f.num_gpus||1,
           target_gpu_ids:targets,
           gpu_args:Object.keys(gpuArgs).length?gpuArgs:null,
+          estimated_dram_gb:f.estimated_dram_gb===''
+            ?null:Number(f.estimated_dram_gb),
           min_free_hbm_gb:f.min_free_hbm_gb===''?null:Number(f.min_free_hbm_gb)});
         if(result._error)return;
       }
@@ -811,9 +820,16 @@ function app(){
     },
     taskGpuText(t){
       const assigned=JSON.parse(t.gpu_ids||'[]');
-      if(assigned.length)return assigned.join(',');
       const targets=JSON.parse(t.target_gpu_ids||'[]');
+      if(assigned.length)return assigned.join(',')
+        +(targets.length?' ← '+targets.join('|'):'');
       return targets.length?'→'+targets.join('|'):'-';
+    },
+    taskGpuArgsText(t){
+      const targets=JSON.parse(t.target_gpu_ids||'[]');
+      if(!targets.length)return 'automatic GPU placement';
+      const args=JSON.parse(t.gpu_args||'{}');
+      return targets.map(g=>'GPU '+g+': '+(args[g]||'(common args only)')).join('\n');
     },
     taskCommand(t){ return t.effective_command
       || [t.command,t.params].filter(Boolean).join(' '); },
@@ -962,6 +978,7 @@ function app(){
         if(k==='command')return this.taskCommand(t).toLowerCase();
         if(k==='name'||k==='status')return (t[k]||'').toLowerCase();
         if(k==='gpu_ids')return t.gpu_ids||t.target_gpu_ids||'';
+        if(k==='estimated_dram_gb')return t.estimated_dram_gb??-1;
         return t[k]??0;
       };
       return base.sort((a,b)=>{

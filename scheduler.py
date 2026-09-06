@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import getpass
 import json
+import math
 import os
 import re
 import shlex
@@ -91,6 +92,7 @@ class Scheduler:
                     target_gpu_ids TEXT DEFAULT '',
                     gpu_args TEXT DEFAULT '',
                     min_free_hbm_gb REAL,
+                    estimated_dram_gb REAL,
                     status TEXT DEFAULT 'queued',
                     gpu_ids TEXT DEFAULT '',
                     pid INTEGER,
@@ -120,6 +122,10 @@ class Scheduler:
             if "gpu_args" not in columns:
                 self.db.execute(
                     "ALTER TABLE tasks ADD COLUMN gpu_args TEXT DEFAULT ''"
+                )
+            if "estimated_dram_gb" not in columns:
+                self.db.execute(
+                    "ALTER TABLE tasks ADD COLUMN estimated_dram_gb REAL"
                 )
             self.db.commit()
             defaults = {
@@ -216,24 +222,56 @@ class Scheduler:
                  num_gpus: int = 1, min_free_hbm_gb: Optional[float] = None,
                  params: str = "",
                  target_gpu_ids: Optional[list[int]] = None,
-                 gpu_args: Optional[dict[int, str]] = None) -> int:
+                 gpu_args: Optional[dict[int, str]] = None,
+                 estimated_dram_gb: Optional[float] = None) -> int:
         targets = (self._normalize_target_gpu_ids(target_gpu_ids)
                    if target_gpu_ids else [])
         args = self._normalize_gpu_args(gpu_args, targets)
+        estimated_dram_gb = self._normalize_estimated_dram_gb(
+            estimated_dram_gb)
         if targets:
             num_gpus = 1
         with self.lock:
             cur = self.db.execute(
                 "INSERT INTO tasks(name, command, params, priority, num_gpus, "
-                "target_gpu_ids, gpu_args, min_free_hbm_gb, status, "
-                "created_at) VALUES(?,?,?,?,?,?,?,?,'queued',?)",
+                "target_gpu_ids, gpu_args, min_free_hbm_gb, "
+                "estimated_dram_gb, status, created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,'queued',?)",
                 (name or command[:40], command, params, priority,
                  max(1, num_gpus), json.dumps(targets) if targets else "",
                  json.dumps(args) if args else "",
-                 min_free_hbm_gb, _now()))
+                 min_free_hbm_gb, estimated_dram_gb, _now()))
             self.db.commit()
             self._bump()
             return cur.lastrowid
+
+    @staticmethod
+    def _normalize_estimated_dram_gb(
+            value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            estimate = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("estimated DRAM must be a number") from exc
+        if not math.isfinite(estimate) or estimate < 0:
+            raise ValueError("estimated DRAM must be a finite non-negative number")
+        return estimate
+
+    @staticmethod
+    def _available_dram_gb() -> float:
+        try:
+            return psutil.virtual_memory().available / 1024**3
+        except Exception:
+            return float("inf")
+
+    @staticmethod
+    def _dram_block_reason(task: dict, available_gb: float) -> str:
+        estimate = task.get("estimated_dram_gb")
+        if estimate is None or estimate <= available_gb:
+            return ""
+        return (f"task #{task['id']} estimated DRAM {estimate:.1f}G > "
+                f"free RAM {available_gb:.1f}G")
 
     def _normalize_gpu_args(
             self, gpu_args: Optional[dict[int, str]],
@@ -593,6 +631,11 @@ class Scheduler:
         if not row or row["status"] != "queued":
             return False
         task = dict(row)
+        dram_reason = self._dram_block_reason(
+            task, self._available_dram_gb())
+        if dram_reason:
+            self._set_state("blocked", dram_reason)
+            return False
         cfg = self.get_config()
         reserved = set(cfg["reserved_gpus"])
         ngpu = self.monitor.count or 0
@@ -647,8 +690,8 @@ class Scheduler:
     def run_now_many(self, ids: list[int]) -> None:
         """一键启动: queue selected tasks for forced launch. They start one per
         dispatch tick (~2s apart) on the GPU(s) with most free HBM, bypassing
-        the RAM gate, dispatch cooldown, pause, HBM gate and per-GPU cap — an
-        explicit operator override. Reserved GPUs are still avoided."""
+        the global min-free-RAM gate, dispatch cooldown, pause, HBM gate and
+        per-GPU cap. Per-task DRAM estimates and reserved GPUs are honored."""
         if not ids:
             return
         with self.lock:
@@ -786,8 +829,12 @@ class Scheduler:
         self.dispatch_state = {"state": state, "reason": reason, "ts": _now()}
 
     def _why_blocked(self, task: dict, sample: dict, cfg: dict, counts: dict,
-                     reserved: set, ngpu: int, util_avg: Optional[dict]) -> str:
+                     reserved: set, ngpu: int, util_avg: Optional[dict],
+                     ram_avail: float) -> str:
         """Per-GPU breakdown of why the top queued task can't be placed."""
+        dram_reason = self._dram_block_reason(task, ram_avail)
+        if dram_reason:
+            return dram_reason
         thr = task["min_free_hbm_gb"]
         thr = cfg["min_free_hbm_gb"] if thr is None else thr
         max_per = cfg["max_tasks_per_gpu"]
@@ -839,13 +886,8 @@ class Scheduler:
 
         # ---- global gates shared by forced + normal dispatch ----------------
         min_free_ram = cfg["min_free_ram_gb"]
-        ram_avail: Optional[float] = None
-        if min_free_ram > 0:
-            try:
-                ram_avail = psutil.virtual_memory().available / 1024**3
-            except Exception:
-                ram_avail = float("inf")
-        ram_blocked = ram_avail is not None and ram_avail < min_free_ram
+        ram_avail = self._available_dram_gb()
+        ram_blocked = ram_avail < min_free_ram
 
         # dispatch cooldown: after a launch, hold off so the new task can
         # actually claim HBM/RAM before the next dispatch decision. Applies to
@@ -863,12 +905,16 @@ class Scheduler:
             force_ids = set(self._force_ids)
 
         # ---- forced launches (一键启动): explicit operator override. Ignores
-        #      the RAM gate, dispatch cooldown, pause, HBM gate, per-GPU cap and
-        #      concurrency limit. Only the one-launch-per-tick spacing (~2s) and
-        #      reserved-GPU avoidance still apply. ---------------------------
+        #      the global min-free-RAM gate, cooldown, pause, HBM gate, per-GPU
+        #      cap and concurrency limit. Per-task DRAM estimates, one-launch-
+        #      per-tick spacing and reserved-GPU avoidance still apply. -------
         if force_ids:
             ftask = next((t for t in queued if t["id"] in force_ids), None)
             if ftask:
+                dram_reason = self._dram_block_reason(ftask, ram_avail)
+                if dram_reason:
+                    self._set_state("blocked", dram_reason)
+                    return changed
                 targets = self._target_gpu_ids(ftask)
                 need = 1 if targets else ftask["num_gpus"]
                 pool = targets or list(range(ngpu))
@@ -920,6 +966,8 @@ class Scheduler:
             return changed
 
         for task in queued:
+            if self._dram_block_reason(task, ram_avail):
+                continue
             targets = self._target_gpu_ids(task)
             need = 1 if targets else task["num_gpus"]
             thr = task["min_free_hbm_gb"]
@@ -953,7 +1001,8 @@ class Scheduler:
 
         # queued tasks exist but none could be placed this tick
         self._set_state("blocked", self._why_blocked(
-            queued[0], sample, cfg, counts, reserved, ngpu, util_avg))
+            queued[0], sample, cfg, counts, reserved, ngpu, util_avg,
+            ram_avail))
         return changed
 
     def _run_logs(self, tid: int) -> list[int]:

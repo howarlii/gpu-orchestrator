@@ -167,6 +167,7 @@ class TaskIn(BaseModel):
     target_gpu_ids: list[int] | None = None
     gpu_args: dict[int, str] | None = None
     min_free_hbm_gb: float | None = None
+    estimated_dram_gb: float | None = None
 
 
 class IdsIn(BaseModel):
@@ -219,7 +220,7 @@ async def add_task(t: TaskIn):
         tid = scheduler.add_task(
             t.command, t.name, t.priority, t.num_gpus,
             t.min_free_hbm_gb, target_gpu_ids=t.target_gpu_ids,
-            gpu_args=t.gpu_args)
+            gpu_args=t.gpu_args, estimated_dram_gb=t.estimated_dram_gb)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"id": tid, "tasks": scheduler.list_tasks()}
@@ -275,8 +276,9 @@ async def retry_failed():
 
 @app.post("/api/tasks/run_now")
 async def run_now(b: RunNowIn):
-    scheduler.run_now(b.id, _latest)
-    return {"tasks": scheduler.list_tasks()}
+    started = scheduler.run_now(b.id, _latest)
+    return {"started": started, "tasks": scheduler.list_tasks(),
+            "dispatch": scheduler.dispatch_state}
 
 
 @app.post("/api/tasks/start")

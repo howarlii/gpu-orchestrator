@@ -7,7 +7,7 @@ REST API (default http://127.0.0.1:8800, override with OCTL_URL).
 Examples:
   octl add "cd ~/proj && python train.py --lr 1e-4" -n train-a -p 5
   octl add "python train.py --epochs 10" --gpu-ids 0,2 \
-    --gpu-arg '0=--data /disk0' --gpu-arg '2=--data /disk2'
+    --gpu-arg '0=--data /disk0' --gpu-arg '2=--data /disk2' --dram 120
   octl ls
   octl status
   octl rm 3 4 5
@@ -70,24 +70,29 @@ def cmd_add(a):
     body = {"command": a.command, "name": a.name or "",
             "priority": a.priority, "num_gpus": a.gpus,
             "target_gpu_ids": targets, "gpu_args": gpu_args or None,
+            "estimated_dram_gb": a.dram,
             "min_free_hbm_gb": a.min_hbm}
     d = req("/api/tasks", "POST", body)
     where = f" on one of GPU {targets}" if targets else ""
-    print(f"queued #{d['id']}{where}  {a.name or a.command[:60]}")
+    dram = f" (est DRAM {a.dram:g}G)" if a.dram is not None else ""
+    print(f"queued #{d['id']}{where}{dram}  {a.name or a.command[:60]}")
 
 
 def _print_tasks(tasks):
     if not tasks:
         print("(no tasks)")
         return
-    print(f"{'ID':>4} {'STATUS':<8} {'PRIO':>4} {'GPU/TARGET':<12} NAME")
+    print(f"{'ID':>4} {'STATUS':<8} {'PRIO':>4} "
+          f"{'GPU/CAND':<12} {'DRAM':>7} NAME")
     for t in tasks:
         gpus = ",".join(map(str, json.loads(t["gpu_ids"] or "[]")))
         if not gpus:
             targets = json.loads(t.get("target_gpu_ids") or "[]")
             gpus = "→" + "|".join(map(str, targets)) if targets else ""
+        estimate = t.get("estimated_dram_gb")
+        dram = f"{estimate:g}G" if estimate is not None else "-"
         print(f"{t['id']:>4} {t['status']:<8} {t['priority']:>4} "
-              f"{gpus:<12} {t['name'] or ''}")
+              f"{gpus:<12} {dram:>7} {t['name'] or ''}")
 
 
 def gpu_ids_arg(value):
@@ -204,6 +209,8 @@ def main():
     s.add_argument("--gpu-arg", type=gpu_arg_arg, action="append", default=[],
                    metavar="GPU=ARGS",
                    help="args appended only to one GPU's task; repeatable")
+    s.add_argument("--dram", type=float, default=None, metavar="GB",
+                   help="estimated task DRAM; wait while free RAM is lower")
     s.add_argument("--min-hbm", type=float, default=None, dest="min_hbm")
     s.set_defaults(fn=cmd_add)
 

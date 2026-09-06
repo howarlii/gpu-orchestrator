@@ -144,6 +144,53 @@ class GpuAffinityTest(unittest.TestCase):
                 "true", target_gpu_ids=[1], gpu_args={2: "--x"}
             )
 
+    def test_dram_estimate_blocks_task_but_allows_smaller_queued_task(self):
+        large = self.scheduler.add_task("large", estimated_dram_gb=80)
+        small = self.scheduler.add_task("small", estimated_dram_gb=40)
+
+        vm = mock.Mock(available=64 * GIB)
+        with mock.patch.object(scheduler.psutil, "virtual_memory",
+                               return_value=vm):
+            self.scheduler.tick(sample())
+
+        self.assertEqual(self.launches, [(small, [0], "small")])
+        tasks = {task["id"]: task for task in self.scheduler.list_tasks()}
+        self.assertEqual(tasks[large]["status"], "queued")
+        self.assertEqual(tasks[large]["estimated_dram_gb"], 80)
+
+    def test_dram_estimate_explains_why_task_is_waiting(self):
+        tid = self.scheduler.add_task("large", estimated_dram_gb=80)
+
+        vm = mock.Mock(available=64 * GIB)
+        with mock.patch.object(scheduler.psutil, "virtual_memory",
+                               return_value=vm):
+            self.scheduler.tick(sample())
+
+        self.assertEqual(self.launches, [])
+        self.assertEqual(
+            self.scheduler.dispatch_state["reason"],
+            f"task #{tid} estimated DRAM 80.0G > free RAM 64.0G",
+        )
+
+    def test_dram_estimate_also_guards_manual_start_paths(self):
+        run_now = self.scheduler.add_task("run-now", estimated_dram_gb=80)
+        forced = self.scheduler.add_task("forced", estimated_dram_gb=80)
+        vm = mock.Mock(available=64 * GIB)
+
+        with mock.patch.object(scheduler.psutil, "virtual_memory",
+                               return_value=vm):
+            self.assertFalse(self.scheduler.run_now(run_now, sample()))
+            self.scheduler.run_now_many([forced])
+            self.scheduler.tick(sample())
+
+        self.assertEqual(self.launches, [])
+        self.assertIn("estimated DRAM 80.0G",
+                      self.scheduler.dispatch_state["reason"])
+
+    def test_rejects_invalid_dram_estimate(self):
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            self.scheduler.add_task("true", estimated_dram_gb=-1)
+
 
 if __name__ == "__main__":
     unittest.main()
