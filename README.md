@@ -41,7 +41,7 @@ Open `http://localhost:8800`. If on a remote box, forward the port:
 - Scheduler bar: edit `max_tasks_per_gpu`, `min_free_hbm_gb`, pause dispatch —
   all applied live.
 - Candidate GPU/resource binding: fill `candidate GPUs` with values such as `0,2`; the task remains one single-GPU run and the scheduler chooses one available candidate. The command and common args are shared. In `per-GPU args`, optionally map each GPU to the external-resource args that must accompany it, one `GPU=ARGS` per line. For example, GPU 0 can append the path for its paired NVMe while GPU 2 appends a different path. A queued choice is shown as `→0|2`; after launch, `0 ← 0|2` shows both the selected GPU and original candidates. External-resource concurrency follows the existing scheduler settings such as `max_tasks_per_gpu`; the mapping itself adds no extra lock.
-- The new-task form and queue table both show candidate/selected GPU information and estimated DRAM. Hover the GPU cell to inspect its per-GPU argument mapping.
+- The new-task form and queue table both show candidate/selected GPU information and estimated DRAM. Hover the GPU cell to inspect its per-GPU argument mapping. Hover anywhere on a task row to see the complete raw task record, including the unmodified original command, plus the derived effective command.
 
 The CLI exposes the same setting:
 

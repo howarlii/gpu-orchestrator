@@ -85,6 +85,8 @@
     border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:11.5px;
     color:var(--fg);white-space:pre-wrap;word-break:break-all;line-height:1.4;
     box-shadow:0 8px 28px rgba(0,0,0,.45);pointer-events:none}
+  .tasktip{max-width:min(900px,86vw);max-height:90vh;overflow:auto;
+    font-family:ui-monospace,SFMono-Regular,Consolas,monospace;word-break:break-word}
   .controls{background:var(--panel);border:1px solid var(--border);border-radius:8px;
     padding:10px;margin:12px 0}
   .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
@@ -406,6 +408,8 @@
             :draggable="canDrag(t)"
             @dragstart="dragStart(t,$event)" @dragover="dragOver(t,$event)"
             @drop.prevent="drop(t)" @dragend="dragEnd()"
+            @mouseenter="showTaskTip($event,t)" @mousemove="moveTaskTip($event)"
+            @mouseleave="taskTip=null"
             @click="rowClick(t,$event)">
             <td><span class="grip" x-show="canDrag(t)"
               title="拖拽调整运行顺序">⠿</span><span x-text="t.id"></span></td>
@@ -474,6 +478,11 @@
   <!-- Running-task resource tooltip -->
   <div class="cmdtip" x-show="usageTip" :style="usageTipStyle()"
     x-text="usageTip?usageTip.text:''" style="display:none"></div>
+
+  <!-- Full raw task record when hovering anywhere on a task row -->
+  <div class="cmdtip tasktip" x-show="taskTip && !cmdTip && !usageTip"
+    :style="taskTipStyle()" x-text="taskTip?taskTip.text:''"
+    style="display:none"></div>
 
   <!-- Log modal -->
   <div class="modal" x-show="logTask" @click.self="logTask=null" style="display:none">
@@ -628,7 +637,7 @@ function app(){
     selected:[], queueTab:'active', filter:'', statusEdit:null,
     evacFor:null, _procMeta:{},
     occupy:{}, defaultUser:'', occFor:null, occUser:'',
-    cmdTip:null, usageTip:null, copiedId:null, anchorId:null,
+    cmdTip:null, usageTip:null, taskTip:null, copiedId:null, anchorId:null,
     sortKey:'queue', sortDir:1, dragId:null, dragOverId:null,
     nowTs:Date.now()/1000, clockOffset:0,
     logTask:null, logText:'', logFollow:true, logCopied:false, _logTimer:null,
@@ -840,6 +849,25 @@ function app(){
       const variants=Object.entries(args);
       return variants.length ? command+'\n\nGPU-specific args:\n'
         +variants.map(([gpu,value])=>'GPU '+gpu+': '+value).join('\n') : command;
+    },
+    taskRawText(t){
+      const raw={...t}; delete raw.effective_command;
+      const fields=Object.entries(raw).filter(([key])=>key!=='command')
+        .map(([key,value])=>key+': '+(value==null?'null':String(value)));
+      return 'TASK #'+t.id+' RAW INFO\n\ncommand (raw):\n'+(t.command??'')
+        +'\n\nall other raw fields:\n'+fields.join('\n')
+        +'\n\neffective command:\n'+this.taskCommand(t);
+    },
+    showTaskTip(e,t){ this.taskTip={text:this.taskRawText(t),x:e.clientX,y:e.clientY}; },
+    moveTaskTip(e){ if(this.taskTip){ this.taskTip.x=e.clientX;this.taskTip.y=e.clientY; } },
+    taskTipStyle(){
+      if(!this.taskTip)return '';
+      const right=this.taskTip.x>window.innerWidth*.55;
+      const bottom=this.taskTip.y>window.innerHeight*.45;
+      return (right?'right:'+(window.innerWidth-this.taskTip.x+14)+'px;'
+        :'left:'+(this.taskTip.x+14)+'px;')
+        +(bottom?'bottom:'+(window.innerHeight-this.taskTip.y+14)+'px;'
+          :'top:'+(this.taskTip.y+14)+'px;');
     },
     one(action,id){ this.runAction(action,[id]); },
     bulk(action){ if(this.selected.length)this.runAction(action,[...this.selected]); },
