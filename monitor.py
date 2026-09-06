@@ -6,7 +6,9 @@ NVML only exposes it at the device level).
 """
 from __future__ import annotations
 
+import re
 import time
+from pathlib import Path
 from typing import Optional
 
 import psutil
@@ -26,6 +28,35 @@ def _decode(b) -> str:
     return str(b)
 
 
+_GDS_READ_RE = re.compile(r"\bread(?:mib|mb)\s*=\s*([0-9.]+)", re.I)
+_GDS_WRITE_RE = re.compile(r"\bwrite(?:mib|mb)\s*=\s*([0-9.]+)", re.I)
+
+
+def _parse_gds_totals(text: str) -> Optional[tuple[int, int]]:
+    """Return cumulative GDS read/write bytes from nvidia-fs proc stats."""
+    read = _GDS_READ_RE.search(text)
+    write = _GDS_WRITE_RE.search(text)
+    if not read or not write:
+        return None
+    mib = 1024**2
+    return int(float(read.group(1)) * mib), int(float(write.group(1)) * mib)
+
+
+def _physical_block_devices() -> set[str]:
+    """Names of whole, non-virtual block devices exposed by sysfs."""
+    devices: set[str] = set()
+    try:
+        for path in Path("/sys/class/block").iterdir():
+            if (path / "partition").exists():
+                continue
+            if "virtual" in path.resolve().parts:
+                continue
+            devices.add(path.name)
+    except OSError:
+        pass
+    return devices
+
+
 class GpuMonitor:
     def __init__(self) -> None:
         self.ok = False
@@ -38,6 +69,9 @@ class GpuMonitor:
         self._last_seen_ts: dict[int, int] = {}
         # system-wide rate counters (disk / net are cumulative -> need deltas)
         self._prev_io: Optional[dict] = None
+        self._prev_gds: Optional[dict] = None
+        self._disk_devices = _physical_block_devices()
+        self._gds_stats_path = Path("/proc/driver/nvidia-fs/stats")
         try:
             psutil.cpu_percent(None)  # prime; first call returns 0.0
         except Exception:
@@ -120,8 +154,21 @@ class GpuMonitor:
         return out
 
     # ---- system-wide (CPU / RAM / disk / net) -------------------------------
+    def _gds_totals(self) -> tuple[str, Optional[tuple[int, int]]]:
+        """Read passive nvidia-fs counters without enabling GDS profiling."""
+        try:
+            text = self._gds_stats_path.read_text()
+        except FileNotFoundError:
+            return "unavailable", None
+        except OSError:
+            return "unreadable", None
+        totals = _parse_gds_totals(text)
+        if totals is None:
+            return "disabled", None
+        return "enabled", totals
+
     def sample_system(self, ts: float) -> dict:
-        """Cheap host-level stats: CPU%, RAM, disk R/W and net U/D rates."""
+        """Cheap host-level CPU, RAM, disk, GDS and network statistics."""
         out: dict = {}
         try:
             out["cpu"] = psutil.cpu_percent(None)
@@ -131,10 +178,43 @@ class GpuMonitor:
             vm = psutil.virtual_memory()
             out["ram_used"] = vm.total - vm.available
             out["ram_total"] = vm.total
+            out["ram_available"] = vm.available
+            out["ram_free"] = vm.free
+            out["ram_cached"] = vm.cached
+            out["ram_buffers"] = vm.buffers
+            out["ram_slab"] = getattr(vm, "slab", None)
         except Exception:
-            out["ram_used"] = out["ram_total"] = None
+            for key in ("ram_used", "ram_total", "ram_available", "ram_free",
+                        "ram_cached", "ram_buffers", "ram_slab"):
+                out[key] = None
+        gds_status, gds_totals = self._gds_totals()
+        out["gds_status"] = gds_status
+        prev_gds = self._prev_gds
+        if gds_totals is not None:
+            dt = (ts - prev_gds["ts"]) if prev_gds else 0.0
+            if prev_gds and dt > 0:
+                previous = prev_gds["totals"]
+                out["gds_r"] = max(0.0, (gds_totals[0] - previous[0]) / dt)
+                out["gds_w"] = max(0.0, (gds_totals[1] - previous[1]) / dt)
+            else:
+                out["gds_r"] = out["gds_w"] = 0.0
+            self._prev_gds = {"ts": ts, "totals": gds_totals}
+        else:
+            out["gds_r"] = out["gds_w"] = None
+            self._prev_gds = None
         try:
-            d = psutil.disk_io_counters()
+            per_disk = psutil.disk_io_counters(perdisk=True) or {}
+            disks = {name: counters for name, counters in per_disk.items()
+                     if name in self._disk_devices}
+            if not disks:
+                aggregate = psutil.disk_io_counters()
+                disks = {"all": aggregate} if aggregate is not None else {}
+            disk_totals = {
+                name: (d.read_bytes, d.write_bytes, d.busy_time)
+                for name, d in disks.items()
+            }
+            out["disk_devices"] = sorted(disks)
+
             # Sum only real (non-loopback) NICs. The default aggregate counter
             # includes `lo`, where a local proxy's relayed traffic is counted on
             # BOTH sent and recv (and again on the physical NIC), inflating the
@@ -148,16 +228,32 @@ class GpuMonitor:
             prev = self._prev_io
             dt = (ts - prev["ts"]) if prev else 0.0
             if prev and dt > 0:
-                out["disk_r"] = max(0.0, (d.read_bytes - prev["dr"]) / dt)
-                out["disk_w"] = max(0.0, (d.write_bytes - prev["dw"]) / dt)
+                previous_disks = prev["disks"]
+                out["disk_r"] = sum(
+                    max(0, vals[0] - previous_disks[name][0])
+                    for name, vals in disk_totals.items()
+                    if name in previous_disks) / dt
+                out["disk_w"] = sum(
+                    max(0, vals[1] - previous_disks[name][1])
+                    for name, vals in disk_totals.items()
+                    if name in previous_disks) / dt
+                busy = [
+                    max(0, vals[2] - previous_disks[name][2]) / (dt * 10)
+                    for name, vals in disk_totals.items()
+                    if name in previous_disks
+                ]
+                out["disk_busy"] = min(100.0, max(busy, default=0.0))
                 out["net_u"] = max(0.0, (ns - prev["ns"]) / dt)
                 out["net_d"] = max(0.0, (nr - prev["nr"]) / dt)
             else:
-                out["disk_r"] = out["disk_w"] = out["net_u"] = out["net_d"] = 0.0
-            self._prev_io = {"ts": ts, "dr": d.read_bytes, "dw": d.write_bytes,
-                             "ns": ns, "nr": nr}
+                out["disk_r"] = out["disk_w"] = out["disk_busy"] = 0.0
+                out["net_u"] = out["net_d"] = 0.0
+            self._prev_io = {"ts": ts, "disks": disk_totals, "ns": ns,
+                             "nr": nr}
         except Exception:
-            out["disk_r"] = out["disk_w"] = out["net_u"] = out["net_d"] = None
+            for key in ("disk_r", "disk_w", "disk_busy", "net_u", "net_d"):
+                out[key] = None
+            out.setdefault("disk_devices", [])
         return out
 
     # ---- main sample --------------------------------------------------------

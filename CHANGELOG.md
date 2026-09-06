@@ -6,6 +6,16 @@
 - Task processes now set `CUDA_DEVICE_ORDER=PCI_BUS_ID`, keeping orchestrator GPU indices aligned with the physical order shown by NVML / `nvidia-smi`.
 - Tasks can declare `estimated_dram_gb` (`est DRAM` in the Web UI, `--dram GB` in `octl`). Normal scheduling, `run now`, and batch force-start keep the task queued whenever its estimate exceeds the host's current available RAM. Candidate/selected GPU information and estimated DRAM are visible directly in the queue table.
 - Hovering anywhere on a queue row shows the complete raw task record, explicitly including the original unmodified command, as well as the derived effective command used after GPU-specific arguments are applied.
+- **Expandable host timelines**: clicking the CPU/RAM/DISK bar reveals 10
+  minutes of CPU utilization, RAM used/cache/buffers/slab, and physical-disk
+  read/write/busy history.
+- **GDS-safe disk accounting**: the disk timeline reads passive kernel block
+  counters, so local filesystem traffic from buffered I/O, direct I/O, native
+  GDS, and Phoenix GPU DMA is included in the same total without probe I/O or
+  profiling overhead.
+### Bug Fixes
+- Disk throughput now sums only whole physical block devices instead of
+  double-counting whole disks, partitions, and virtual/LVM layers.
 
 ## [0.6.0] - 2026-07-01
 ### Features

@@ -40,6 +40,18 @@
   .sysitem b.rate{display:inline-block;min-width:62px;text-align:right;
     font-variant-numeric:tabular-nums;font-feature-settings:"tnum"}
   .sysitem.io{min-width:190px}
+  .hostcard{padding:0;margin-top:10px;overflow:hidden}
+  .hostcard>.sysbar{margin:0;border:0;border-radius:0;background:transparent;
+    cursor:pointer;user-select:none}
+  .hostcard>.sysbar:hover{background:rgba(88,166,255,.035)}
+  .hostfold{margin-left:auto;color:var(--dim);font-size:14px}
+  .hostdetail{border-top:1px solid var(--border);padding:10px 12px 8px}
+  .hostcharts{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+  .hostmeta{display:flex;flex-wrap:wrap;gap:5px 16px;margin-top:8px;
+    color:var(--dim);font-size:10.5px}
+  .hostmeta b{color:var(--fg);font-weight:600}
+  .dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:4px}
+  @media(max-width:1000px){.hostcharts{grid-template-columns:1fr}}
   /* scheduler config: each group (调度 / CPU / GPU) is a fieldset card whose
      title sits as a legend on the top border, colour-coded by concern */
   .cfggroups{display:flex;flex-wrap:wrap;gap:10px;margin-top:12px;align-items:flex-start}
@@ -214,20 +226,46 @@
     </template>
   </div>
 
-  <!-- Host (CPU / RAM / disk / net) — compact single row -->
-  <div class="card sysbar">
-    <div class="sysitem"><span class="label">CPU</span>
-      <div class="bar wide"><i :style="`width:${Math.min(100,sys.cpu||0)}%;background:var(--green)`"></i></div>
-      <b style="min-width:34px;text-align:right" x-text="sys.cpu==null?'-':Math.round(sys.cpu)+'%'"></b></div>
-    <div class="sysitem"><span class="label">RAM</span>
-      <div class="bar wide"><i :style="`width:${ramPct()}%;background:var(--mem)`"></i></div>
-      <b x-text="fmtGiB(sys.ram_used)+' / '+fmtGiB(sys.ram_total)"></b></div>
-    <div class="sysitem io"><span class="label">DISK</span>
-      <b class="rate" style="color:var(--green)" x-text="'R '+fmtRate(sys.disk_r)"></b>
-      <b class="rate" style="color:var(--blue)" x-text="'W '+fmtRate(sys.disk_w)"></b></div>
-    <div class="sysitem io"><span class="label">NET</span>
-      <b class="rate" style="color:var(--green)" x-text="'↑'+fmtRate(sys.net_u)"></b>
-      <b class="rate" style="color:var(--blue)" x-text="'↓'+fmtRate(sys.net_d)"></b></div>
+  <!-- Host (CPU / RAM / disk / net) — click to reveal 10-minute timelines -->
+  <div class="card hostcard">
+    <div class="sysbar" @click="toggleHost()" title="点击展开 CPU / RAM / DISK 时间线">
+      <div class="sysitem"><span class="label">CPU</span>
+        <div class="bar wide"><i :style="`width:${Math.min(100,sys.cpu||0)}%;background:var(--green)`"></i></div>
+        <b style="min-width:34px;text-align:right" x-text="sys.cpu==null?'-':Math.round(sys.cpu)+'%'"></b></div>
+      <div class="sysitem"><span class="label">RAM</span>
+        <div class="bar wide"><i :style="`width:${ramPct()}%;background:var(--mem)`"></i></div>
+        <b x-text="fmtGiB(sys.ram_used)+' / '+fmtGiB(sys.ram_total)"></b></div>
+      <div class="sysitem io"><span class="label">DISK</span>
+        <b class="rate" style="color:var(--green)" x-text="'R '+fmtRate(sys.disk_r)"></b>
+        <b class="rate" style="color:var(--blue)" x-text="'W '+fmtRate(sys.disk_w)"></b>
+        <b x-show="sys.disk_busy!=null" x-text="Math.round(sys.disk_busy)+'%'"
+          title="最忙物理磁盘的 busy time"></b></div>
+      <div class="sysitem io"><span class="label">NET</span>
+        <b class="rate" style="color:var(--green)" x-text="'↑'+fmtRate(sys.net_u)"></b>
+        <b class="rate" style="color:var(--blue)" x-text="'↓'+fmtRate(sys.net_d)"></b></div>
+      <span class="hostfold" x-text="showHost?'▾':'▸'"></span>
+    </div>
+    <div class="hostdetail" x-show="showHost" x-cloak>
+      <div class="hostcharts">
+        <div class="chart" id="host-cpu-chart"></div>
+        <div class="chart" id="host-ram-chart"></div>
+        <div class="chart" id="host-disk-chart"></div>
+      </div>
+      <div class="hostmeta">
+        <span><i class="dot" style="background:var(--mem)"></i>used
+          <b x-text="fmtGiB(sys.ram_used)"></b></span>
+        <span><i class="dot" style="background:var(--green)"></i>available
+          <b x-text="fmtGiB(sys.ram_available)"></b></span>
+        <span><i class="dot" style="background:var(--blue)"></i>cache
+          <b x-text="fmtGiB(sys.ram_cached)"></b></span>
+        <span><i class="dot" style="background:var(--yellow)"></i>buffers
+          <b x-text="fmtGiB(sys.ram_buffers)"></b></span>
+        <span><i class="dot" style="background:var(--purple)"></i>slab
+          <b x-text="fmtGiB(sys.ram_slab)"></b></span>
+        <span :title="(sys.disk_devices||[]).join(', ')">physical disks
+          <b x-text="(sys.disk_devices||[]).length"></b></span>
+      </div>
+    </div>
   </div>
 
   <!-- Unified process table (nvitop-style) -->
@@ -516,6 +554,9 @@
 const HLEN = 600;
 const charts = {};   // index -> {util, pcie}
 const buf = {};      // index -> {x, util, mem, tx, rx}
+const systemCharts = {};
+const systemBuf = {x:[],cpu:[],ramUsed:[],ramCache:[],ramBuffers:[],ramSlab:[],
+  diskR:[],diskW:[],diskBusy:[]};
 
 function tooltipPlugin(fmt){
   let tip;
@@ -539,7 +580,7 @@ function tooltipPlugin(fmt){
         const ser=u.series[s], v=u.data[s][idx];
         const col=typeof ser.stroke==='function'?ser.stroke(u,s):ser.stroke;
         html+='<br><span style="color:'+col+'">■</span> '+ser.label+' '
-             +(v==null?'-':fmt(Math.round(v*100)/100));
+             +(v==null?'-':fmt(Math.round(v*100)/100,ser));
       }
       tip.innerHTML=html;
       tip.style.display='block';
@@ -606,7 +647,10 @@ function sizeChart(i){
     charts[i].pcie.setSize({width:ep.clientWidth,height:138});
   }
 }
-window.addEventListener('resize',()=>Object.keys(charts).forEach(i=>sizeChart(i)));
+window.addEventListener('resize',()=>{
+  Object.keys(charts).forEach(i=>sizeChart(i));
+  sizeSystemCharts();
+});
 
 function pushHistory(i,row){
   // row = [ts, util, mem_used, tx, rx]
@@ -623,6 +667,113 @@ function redraw(i){
   const b=buf[i]; if(!b||!charts[i]) return;
   charts[i].util.setData([b.x,b.util,b.mem]);
   charts[i].pcie.setData([b.x,b.tx,b.rx]);
+}
+
+function resetSystemHistory(){
+  Object.keys(systemBuf).forEach(k=>systemBuf[k].length=0);
+}
+
+function pushSystemHistory(row){
+  // [ts,cpu,ram used/total/available/cache/buffers/slab,disk read/write/busy]
+  if(!row) return;
+  const total=row[3]||1;
+  const pct=v=>v==null?null:v/total*100;
+  systemBuf.x.push(row[0]);
+  systemBuf.cpu.push(row[1]);
+  systemBuf.ramUsed.push(pct(row[2]));
+  systemBuf.ramCache.push(pct(row[5]));
+  systemBuf.ramBuffers.push(pct(row[6]));
+  systemBuf.ramSlab.push(pct(row[7]));
+  systemBuf.diskR.push(row[8]==null?null:row[8]/1e9);
+  systemBuf.diskW.push(row[9]==null?null:row[9]/1e9);
+  systemBuf.diskBusy.push(row[10]);
+  if(systemBuf.x.length>HLEN){
+    Object.keys(systemBuf).forEach(k=>systemBuf[k].shift());
+  }
+}
+
+function systemSampleRow(sample){
+  const s=(sample&&sample.sys)||{};
+  return [sample.ts,s.cpu,s.ram_used,s.ram_total,s.ram_available,
+    s.ram_cached,s.ram_buffers,s.ram_slab,s.disk_r,s.disk_w,s.disk_busy];
+}
+
+function diskChartOpts(){
+  return {
+    width:180,height:160,title:'DISK throughput / busy',padding:[6,8,0,2],
+    cursor:{x:true,y:false},legend:{show:false},
+    plugins:[tooltipPlugin((v,s)=>s.scale==='pct'?v.toFixed(0)+'%':v.toFixed(2)+'G/s')],
+    scales:{
+      x:{time:true},
+      io:{range:(u,dmin,dmax)=>[0,Math.max(0.1,(dmax||0)*1.05)]},
+      pct:{range:[0,100]},
+    },
+    axes:[
+      {scale:'x',stroke:'#8b949e',grid:{stroke:'#21262d'},size:26,gap:2,
+       values:(u,v)=>v.map(t=>{const d=new Date(t*1000);
+         return ('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)})},
+      {scale:'io',stroke:'#8b949e',grid:{stroke:'#21262d'},size:46,gap:4,
+       values:(u,v)=>v.map(x=>(+x).toFixed(1))},
+      {scale:'pct',side:1,stroke:'#f85149',grid:{show:false},size:35,gap:4,
+       values:(u,v)=>v.map(x=>Math.round(x)+'%')},
+    ],
+    series:[
+      {},
+      {label:'read',scale:'io',stroke:'#3fb950',width:1.5},
+      {label:'write',scale:'io',stroke:'#58a6ff',width:1.5},
+      {label:'busy',scale:'pct',stroke:'#f85149',width:1,dash:[5,4]},
+    ],
+  };
+}
+
+function makeSystemCharts(){
+  if(systemCharts.cpu) return;
+  const ec=document.getElementById('host-cpu-chart');
+  const er=document.getElementById('host-ram-chart');
+  const ed=document.getElementById('host-disk-chart');
+  if(!ec||!er||!ed) return;
+  systemCharts.cpu=new uPlot(chartOpts('CPU usage',[
+    {},{label:'CPU',stroke:'#3fb950',width:1.5,fill:'rgba(63,185,80,.12)'}
+  ],v=>v.toFixed(0)+'%',[0,100]),[[],[]],ec);
+  systemCharts.ram=new uPlot(chartOpts('RAM % of total',[
+    {},
+    {label:'used',stroke:'#db61a2',width:1.8},
+    {label:'cache',stroke:'#58a6ff',width:1.2},
+    {label:'buffers',stroke:'#d29922',width:1.2},
+    {label:'slab',stroke:'#bc8cff',width:1.2}
+  ],v=>v.toFixed(1)+'%',[0,100]),[[],[],[],[],[]],er);
+  systemCharts.disk=new uPlot(diskChartOpts(),[[],[],[],[]],ed);
+  const ct=ec.querySelector('.u-title'),rt=er.querySelector('.u-title');
+  const dt=ed.querySelector('.u-title');
+  if(ct) ct.innerHTML='<span style="color:#3fb950">■</span>CPU usage (%)';
+  if(rt) rt.innerHTML='<span style="color:#db61a2">■</span>used '
+    +'<span style="color:#58a6ff">■</span>cache '
+    +'<span style="color:#d29922">■</span>buffers '
+    +'<span style="color:#bc8cff">■</span>slab (%)';
+  if(dt) dt.innerHTML='<span style="color:#3fb950">■</span>read '
+    +'<span style="color:#58a6ff">■</span>write '
+    +'<span style="color:#f85149">■</span>busy';
+  sizeSystemCharts();
+  redrawSystem();
+}
+
+function sizeSystemCharts(){
+  const ids={cpu:'host-cpu-chart',ram:'host-ram-chart',disk:'host-disk-chart'};
+  Object.entries(ids).forEach(([key,id])=>{
+    const el=document.getElementById(id);
+    if(systemCharts[key]&&el&&el.clientWidth){
+      systemCharts[key].setSize({width:el.clientWidth,height:160});
+    }
+  });
+}
+
+function redrawSystem(){
+  if(!systemCharts.cpu) return;
+  systemCharts.cpu.setData([systemBuf.x,systemBuf.cpu]);
+  systemCharts.ram.setData([systemBuf.x,systemBuf.ramUsed,systemBuf.ramCache,
+    systemBuf.ramBuffers,systemBuf.ramSlab]);
+  systemCharts.disk.setData([systemBuf.x,systemBuf.diskR,systemBuf.diskW,
+    systemBuf.diskBusy]);
 }
 
 function app(){
@@ -645,13 +796,20 @@ function app(){
     _pidmap:{},
     oneCol: localStorage.getItem('oneCol')==='1',
     showNewTask: localStorage.getItem('showNewTask')==='1',
+    showHost: localStorage.getItem('showHost')==='1',
 
     init(){ this.connect();
       setInterval(()=>{ this.nowTs=Date.now()/1000+this.clockOffset; },1000); },
     toggleNewTask(){ this.showNewTask=!this.showNewTask;
       localStorage.setItem('showNewTask', this.showNewTask?'1':'0'); },
-    _resizeCharts(){ requestAnimationFrame(()=>
-      Object.keys(charts).forEach(i=>sizeChart(i))); },
+    _resizeCharts(){ requestAnimationFrame(()=>{
+      Object.keys(charts).forEach(i=>sizeChart(i)); sizeSystemCharts();
+    }); },
+    toggleHost(){
+      this.showHost=!this.showHost;
+      localStorage.setItem('showHost',this.showHost?'1':'0');
+      if(this.showHost)this.$nextTick(()=>{makeSystemCharts();sizeSystemCharts();});
+    },
     toggleCols(){
       this.oneCol=!this.oneCol;
       localStorage.setItem('oneCol', this.oneCol?'1':'0');
@@ -677,6 +835,8 @@ function app(){
         this.mergeProcMeta(m.sample);
         this.gpus=m.sample.gpus||[];
         this.sys=m.sample.sys||{};
+        resetSystemHistory();
+        (m.system_history||[]).forEach(pushSystemHistory);
         this.$nextTick(()=>{
           makeCharts(this.gpus);
           Object.entries(m.history||{}).forEach(([i,rows])=>{
@@ -685,11 +845,14 @@ function app(){
             rows.forEach(r=>pushHistory(i,r));
             redraw(i);
           });
+          if(this.showHost)makeSystemCharts();
+          redrawSystem();
         });
       } else if(m.type==='tick'){
         this.mergeProcMeta(m.sample);
         this.gpus=m.sample.gpus||[];
         this.sys=m.sample.sys||{};
+        pushSystemHistory(systemSampleRow(m.sample));
         if(m.sample&&m.sample.ts){ this.clockOffset=m.sample.ts-Date.now()/1000; }
         if(m.usage) this.usage=m.usage;
         if(m.tasks) this.tasks=m.tasks;
@@ -702,6 +865,8 @@ function app(){
             pushHistory(g.index,[m.sample.ts,g.util,g.mem_used,g.pcie_tx,g.pcie_rx]);
             redraw(g.index);
           });
+          if(this.showHost)makeSystemCharts();
+          redrawSystem();
         });
       }
     },
@@ -763,7 +928,6 @@ function app(){
     memPct(g){ return g.mem_total?Math.round((g.mem_used||0)/g.mem_total*100):0; },
     ramPct(){ return this.sys.ram_total
       ?Math.round((this.sys.ram_used||0)/this.sys.ram_total*100):0; },
-
     // tasks
     async api(url,method='POST',body=null){
       const r=await fetch(url,{method,headers:{'Content-Type':'application/json'},

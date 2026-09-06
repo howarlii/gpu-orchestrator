@@ -35,6 +35,10 @@ Open `http://localhost:8800`. If on a remote box, forward the port:
 - GPU cards: util%/mem% bars + two history charts (util%/mem%, PCIe tx/rx MB/s)
   + per-process table. PCIe is **device-level only** — NVML does not expose
   per-process PCIe throughput.
+- Host bar: click to expand 10-minute CPU, RAM-breakdown, and physical-disk
+  timelines. RAM includes used/available/cache/buffers/slab. Disk collection
+  reads kernel block counters only, so local filesystem I/O includes buffered,
+  direct-I/O, and GPU-direct DMA paths such as Phoenix in one total.
 - Queue: multi-select, batch delete/requeue/set-priority, click column headers
   to sort (id/name/command-lexicographic/status/priority/gpu/runtime), live log
   viewer with follow.

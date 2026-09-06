@@ -29,6 +29,9 @@ scheduler = Scheduler(monitor)
 history: dict[int, collections.deque] = {
     i: collections.deque(maxlen=HISTORY_LEN) for i in range(monitor.count)
 }
+# [ts, cpu, ram used/total/available/cache/buffers/slab,
+#  disk read/write/busy, GDS read/write]
+system_history: collections.deque = collections.deque(maxlen=HISTORY_LEN)
 _latest: dict = {"ts": 0, "ok": monitor.ok, "gpus": []}
 _clients: set[WebSocket] = set()
 # bandwidth diffing: only resend the (heavy) task list / config when the
@@ -68,6 +71,14 @@ def _record(sample: dict) -> None:
             g.get("util"), g.get("mem_used"),
             g.get("pcie_tx"), g.get("pcie_rx"),
         ])
+    sys = sample.get("sys", {})
+    system_history.append([
+        round(sample["ts"], 1), sys.get("cpu"), sys.get("ram_used"),
+        sys.get("ram_total"), sys.get("ram_available"),
+        sys.get("ram_cached"), sys.get("ram_buffers"), sys.get("ram_slab"),
+        sys.get("disk_r"), sys.get("disk_w"), sys.get("disk_busy"),
+        sys.get("gds_r"), sys.get("gds_w"),
+    ])
 
 
 async def _monitor_loop() -> None:
@@ -141,6 +152,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
             "type": "snapshot",
             "static": monitor.static,
             "history": {i: list(h) for i, h in history.items()},
+            "system_history": list(system_history),
             "sample": _latest,
             "tasks": scheduler.list_tasks(),
             "config": scheduler.get_config(),
