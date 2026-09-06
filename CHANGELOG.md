@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+### Features
+- A single-GPU task can declare several candidate physical GPUs and optional per-GPU `GPU=ARGS` suffixes for paired external resources such as GDS/NVMe paths. The scheduler runs the task exactly once on one eligible candidate and appends only that GPU's args. The candidate map persists through requeue and otherwise follows the existing scheduler gates. The Web form and `octl add --gpu-ids 0,2 --gpu-arg '0=...'` expose the feature.
+- Task processes now set `CUDA_DEVICE_ORDER=PCI_BUS_ID`, keeping orchestrator GPU indices aligned with the physical order shown by NVML / `nvidia-smi`.
+
 ## [0.6.0] - 2026-07-01
 ### Features
 - **暂停 / 恢复 (pause / resume)**: a new `paused` task state. Pausing a

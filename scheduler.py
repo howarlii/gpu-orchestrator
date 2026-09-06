@@ -88,6 +88,8 @@ class Scheduler:
                     params TEXT DEFAULT '',
                     priority INTEGER DEFAULT 0,
                     num_gpus INTEGER DEFAULT 1,
+                    target_gpu_ids TEXT DEFAULT '',
+                    gpu_args TEXT DEFAULT '',
                     min_free_hbm_gb REAL,
                     status TEXT DEFAULT 'queued',
                     gpu_ids TEXT DEFAULT '',
@@ -108,6 +110,17 @@ class Scheduler:
                 );
                 """
             )
+            columns = {
+                r["name"] for r in self.db.execute("PRAGMA table_info(tasks)")
+            }
+            if "target_gpu_ids" not in columns:
+                self.db.execute(
+                    "ALTER TABLE tasks ADD COLUMN target_gpu_ids TEXT DEFAULT ''"
+                )
+            if "gpu_args" not in columns:
+                self.db.execute(
+                    "ALTER TABLE tasks ADD COLUMN gpu_args TEXT DEFAULT ''"
+                )
             self.db.commit()
             defaults = {
                 "max_tasks_per_gpu": "1",
@@ -201,17 +214,103 @@ class Scheduler:
     # ---- task CRUD ----------------------------------------------------------
     def add_task(self, command: str, name: str = "", priority: int = 0,
                  num_gpus: int = 1, min_free_hbm_gb: Optional[float] = None,
-                 params: str = "") -> int:
+                 params: str = "",
+                 target_gpu_ids: Optional[list[int]] = None,
+                 gpu_args: Optional[dict[int, str]] = None) -> int:
+        targets = (self._normalize_target_gpu_ids(target_gpu_ids)
+                   if target_gpu_ids else [])
+        args = self._normalize_gpu_args(gpu_args, targets)
+        if targets:
+            num_gpus = 1
         with self.lock:
             cur = self.db.execute(
                 "INSERT INTO tasks(name, command, params, priority, num_gpus, "
-                "min_free_hbm_gb, status, created_at) "
-                "VALUES(?,?,?,?,?,?,'queued',?)",
+                "target_gpu_ids, gpu_args, min_free_hbm_gb, status, "
+                "created_at) VALUES(?,?,?,?,?,?,?,?,'queued',?)",
                 (name or command[:40], command, params, priority,
-                 max(1, num_gpus), min_free_hbm_gb, _now()))
+                 max(1, num_gpus), json.dumps(targets) if targets else "",
+                 json.dumps(args) if args else "",
+                 min_free_hbm_gb, _now()))
             self.db.commit()
             self._bump()
             return cur.lastrowid
+
+    def _normalize_gpu_args(
+            self, gpu_args: Optional[dict[int, str]],
+            targets: list[int]) -> dict[int, str]:
+        args = {int(gpu): str(value).strip()
+                for gpu, value in (gpu_args or {}).items()}
+        if args and not targets:
+            raise ValueError("target GPU IDs are required with GPU-specific args")
+        extra = set(args) - set(targets)
+        if extra:
+            raise ValueError(
+                f"GPU-specific args provided for unselected GPU(s): {sorted(extra)}"
+            )
+        return args
+
+    def _normalize_target_gpu_ids(self, gpu_ids: list[int]) -> list[int]:
+        if not gpu_ids:
+            raise ValueError("at least one target GPU is required")
+        targets: list[int] = []
+        for raw in gpu_ids:
+            gpu = self._normalize_target_gpu_id(raw)
+            assert gpu is not None
+            if gpu in targets:
+                raise ValueError(f"duplicate GPU ID: {gpu}")
+            targets.append(gpu)
+        return targets
+
+    def _normalize_target_gpu_id(self, raw: int) -> int:
+        if isinstance(raw, bool):
+            raise ValueError("GPU IDs must be integers")
+        try:
+            gpu = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("GPU IDs must be integers") from exc
+        if gpu < 0:
+            raise ValueError("GPU IDs must be non-negative")
+        ngpu = self.monitor.count or 0
+        if ngpu and gpu >= ngpu:
+            raise ValueError(
+                f"GPU ID out of range: {gpu}; host has {ngpu} GPU(s)"
+            )
+        return gpu
+
+    @staticmethod
+    def _target_gpu_ids(task: dict) -> list[int]:
+        raw = task.get("target_gpu_ids") or ""
+        if not raw:
+            return []
+        try:
+            return [int(gpu) for gpu in json.loads(raw)]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+
+    @staticmethod
+    def _task_gpu_args(task: dict) -> dict[int, str]:
+        raw = task.get("gpu_args") or ""
+        if not raw:
+            return {}
+        try:
+            return {int(gpu): str(args)
+                    for gpu, args in json.loads(raw).items()}
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            return {}
+
+    @classmethod
+    def _task_command(cls, task: dict,
+                      gpu_ids: Optional[list[int]] = None) -> str:
+        parts = [task["command"].strip(), (task.get("params") or "").strip()]
+        assigned = gpu_ids
+        if assigned is None:
+            try:
+                assigned = json.loads(task.get("gpu_ids") or "[]")
+            except (TypeError, json.JSONDecodeError):
+                assigned = []
+        if len(assigned) == 1:
+            parts.append(cls._task_gpu_args(task).get(int(assigned[0]), ""))
+        return " ".join(part for part in parts if part)
 
     def list_tasks(self) -> list[dict]:
         with self.lock:
@@ -219,7 +318,10 @@ class Scheduler:
                 "SELECT * FROM tasks ORDER BY "
                 "CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 "
                 "ELSE 2 END, priority DESC, id ASC").fetchall()
-        return [dict(r) for r in rows]
+        tasks = [dict(r) for r in rows]
+        for task in tasks:
+            task["effective_command"] = self._task_command(task)
+        return tasks
 
     def update_tasks(self, ids: list[int], **fields) -> None:
         if not ids or not fields:
@@ -346,12 +448,14 @@ class Scheduler:
         run_no = (max(runs) + 1) if runs else 1
         log_path = str(LOG_DIR / f"task_{task['id']}.{run_no}.log")
         env = dict(os.environ)
+        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
+        command = self._task_command(task, gpu_ids)
         logf = open(log_path, "wb", buffering=0)
         logf.write(f"# task {task['id']} on GPU {gpu_ids} @ "
-                   f"{time.ctime()}\n# {task['command']}\n\n".encode())
+                   f"{time.ctime()}\n# {command}\n\n".encode())
         proc = subprocess.Popen(
-            task["command"], shell=True, env=env,
+            command, shell=True, env=env,
             stdout=logf, stderr=subprocess.STDOUT,
             preexec_fn=os.setsid, cwd=os.path.expanduser("~"))
         with self.lock:
@@ -489,15 +593,18 @@ class Scheduler:
         if not row or row["status"] != "queued":
             return False
         task = dict(row)
-        need = task["num_gpus"]
         cfg = self.get_config()
         reserved = set(cfg["reserved_gpus"])
         ngpu = self.monitor.count or 0
-        cands = [g for g in range(ngpu) if g not in reserved]
+        targets = self._target_gpu_ids(task)
+        need = 1 if targets else task["num_gpus"]
+        pool = targets or list(range(ngpu))
+        cands = [g for g in pool if 0 <= g < ngpu and g not in reserved]
         if len(cands) < need:
             return False
-        cands.sort(key=lambda g: -self._free_hbm_gb(g, sample))
-        self._launch(task, cands[:need])
+        chosen = sorted(
+            cands, key=lambda g: -self._free_hbm_gb(g, sample))[:need]
+        self._launch(task, chosen)
         return True
 
     def pin_tasks(self, ids: list[int]) -> None:
@@ -685,8 +792,13 @@ class Scheduler:
         thr = cfg["min_free_hbm_gb"] if thr is None else thr
         max_per = cfg["max_tasks_per_gpu"]
         max_util = cfg["max_gpu_util_pct"]
-        n_res = n_cap = n_busy = n_hbm = 0
-        for gpu in range(ngpu):
+        targets = self._target_gpu_ids(task)
+        pool = targets or list(range(ngpu))
+        n_invalid = n_res = n_cap = n_busy = n_hbm = 0
+        for gpu in pool:
+            if gpu < 0 or gpu >= ngpu:
+                n_invalid += 1
+                continue
             if gpu in reserved:
                 n_res += 1
                 continue
@@ -699,12 +811,17 @@ class Scheduler:
                 continue
             if self._free_hbm_gb(gpu, sample) < thr:
                 n_hbm += 1
-        parts = [f"{n_res} reserved", f"{n_cap} at task cap"]
+        parts = []
+        if n_invalid:
+            parts.append(f"{n_invalid} invalid")
+        parts.extend([f"{n_res} reserved", f"{n_cap} at task cap"])
         if max_util > 0:
             parts.append(f"{n_busy} busy (util≥{max_util:.0f}%)")
         parts.append(f"{n_hbm} below {thr:.0f}G free HBM")
-        return (f"no GPU free for task #{task['id']} (needs "
-                f"{task['num_gpus']}): " + ", ".join(parts))
+        scope = f"candidate GPU(s) {targets}" if targets else "GPU"
+        need = 1 if targets else task["num_gpus"]
+        return (f"no {scope} free for task #{task['id']} (needs {need}): "
+                + ", ".join(parts))
 
     def tick(self, sample: dict, util_avg: Optional[dict] = None) -> bool:
         """One dispatch step. Returns True if state changed.
@@ -752,11 +869,15 @@ class Scheduler:
         if force_ids:
             ftask = next((t for t in queued if t["id"] in force_ids), None)
             if ftask:
-                need = ftask["num_gpus"]
-                cands = [g for g in range(ngpu) if g not in reserved]
+                targets = self._target_gpu_ids(ftask)
+                need = 1 if targets else ftask["num_gpus"]
+                pool = targets or list(range(ngpu))
+                cands = [g for g in pool
+                         if 0 <= g < ngpu and g not in reserved]
                 if len(cands) >= need:
-                    cands.sort(key=lambda g: -self._free_hbm_gb(g, sample))
-                    chosen = cands[:need]
+                    chosen = sorted(
+                        cands,
+                        key=lambda g: -self._free_hbm_gb(g, sample))[:need]
                     self._launch(ftask, chosen)
                     with self.lock:
                         self._force_ids.discard(ftask["id"])
@@ -765,7 +886,7 @@ class Scheduler:
                     return True
                 self._set_state("blocked", f"force-start task #{ftask['id']}: "
                                 f"needs {need} GPU(s), only {len(cands)} "
-                                f"unreserved")
+                                f"eligible candidates")
                 return changed
 
         # ---- normal gated dispatch ------------------------------------------
@@ -799,11 +920,15 @@ class Scheduler:
             return changed
 
         for task in queued:
-            need = task["num_gpus"]
+            targets = self._target_gpu_ids(task)
+            need = 1 if targets else task["num_gpus"]
             thr = task["min_free_hbm_gb"]
             thr = cfg["min_free_hbm_gb"] if thr is None else thr
             cands = []
-            for gpu in range(ngpu):
+            pool = targets or list(range(ngpu))
+            for gpu in pool:
+                if gpu < 0 or gpu >= ngpu:
+                    continue
                 if gpu in reserved:
                     continue
                 if counts.get(gpu, 0) >= max_per:
@@ -819,9 +944,8 @@ class Scheduler:
                 cands.append(gpu)
             if len(cands) < need:
                 continue
-            # prefer GPUs with fewest running tasks
-            cands.sort(key=lambda g: (counts.get(g, 0), g))
-            chosen = cands[:need]
+            chosen = sorted(
+                cands, key=lambda g: (counts.get(g, 0), g))[:need]
             self._launch(task, chosen)
             self._set_state("dispatching",
                             f"started task #{task['id']} on GPU {chosen}")

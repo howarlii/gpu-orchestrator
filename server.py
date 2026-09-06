@@ -7,7 +7,7 @@ import getpass
 import time
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -164,6 +164,8 @@ class TaskIn(BaseModel):
     name: str = ""
     priority: int = 0
     num_gpus: int = 1
+    target_gpu_ids: list[int] | None = None
+    gpu_args: dict[int, str] | None = None
     min_free_hbm_gb: float | None = None
 
 
@@ -213,8 +215,13 @@ class StatusIn(BaseModel):
 
 @app.post("/api/tasks")
 async def add_task(t: TaskIn):
-    tid = scheduler.add_task(t.command, t.name, t.priority, t.num_gpus,
-                             t.min_free_hbm_gb)
+    try:
+        tid = scheduler.add_task(
+            t.command, t.name, t.priority, t.num_gpus,
+            t.min_free_hbm_gb, target_gpu_ids=t.target_gpu_ids,
+            gpu_args=t.gpu_args)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"id": tid, "tasks": scheduler.list_tasks()}
 
 

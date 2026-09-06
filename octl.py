@@ -6,6 +6,8 @@ REST API (default http://127.0.0.1:8800, override with OCTL_URL).
 
 Examples:
   octl add "cd ~/proj && python train.py --lr 1e-4" -n train-a -p 5
+  octl add "python train.py --epochs 10" --gpu-ids 0,2 \
+    --gpu-arg '0=--data /disk0' --gpu-arg '2=--data /disk2'
   octl ls
   octl status
   octl rm 3 4 5
@@ -33,6 +35,12 @@ def req(path, method="GET", body=None):
     try:
         with urllib.request.urlopen(r, timeout=15) as resp:
             return json.load(resp)
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.load(e).get("detail", str(e))
+        except Exception:
+            detail = str(e)
+        sys.exit(f"octl: request failed: {detail}")
     except urllib.error.URLError as e:
         sys.exit(f"octl: cannot reach orchestrator at {BASE}: {e}")
 
@@ -46,22 +54,71 @@ def gbps(b):
 
 
 def cmd_add(a):
+    gpu_args = {}
+    for gpu, args in a.gpu_arg:
+        if gpu in gpu_args:
+            sys.exit(f"octl: duplicate --gpu-arg for GPU {gpu}")
+        gpu_args[gpu] = args
+    targets = a.gpu_ids
+    if gpu_args and targets is None:
+        targets = list(gpu_args)
+    if targets and a.gpus != 1:
+        sys.exit("octl: --gpus cannot be combined with --gpu-ids/--gpu-arg")
+    extra = set(gpu_args) - set(targets or [])
+    if extra:
+        sys.exit(f"octl: GPU args supplied for unselected GPU(s): {sorted(extra)}")
     body = {"command": a.command, "name": a.name or "",
             "priority": a.priority, "num_gpus": a.gpus,
+            "target_gpu_ids": targets, "gpu_args": gpu_args or None,
             "min_free_hbm_gb": a.min_hbm}
     d = req("/api/tasks", "POST", body)
-    print(f"queued #{d['id']}  {a.name or a.command[:60]}")
+    where = f" on one of GPU {targets}" if targets else ""
+    print(f"queued #{d['id']}{where}  {a.name or a.command[:60]}")
 
 
 def _print_tasks(tasks):
     if not tasks:
         print("(no tasks)")
         return
-    print(f"{'ID':>4} {'STATUS':<8} {'PRIO':>4} {'GPU':<6} NAME")
+    print(f"{'ID':>4} {'STATUS':<8} {'PRIO':>4} {'GPU/TARGET':<12} NAME")
     for t in tasks:
         gpus = ",".join(map(str, json.loads(t["gpu_ids"] or "[]")))
+        if not gpus:
+            targets = json.loads(t.get("target_gpu_ids") or "[]")
+            gpus = "→" + "|".join(map(str, targets)) if targets else ""
         print(f"{t['id']:>4} {t['status']:<8} {t['priority']:>4} "
-              f"{gpus:<6} {t['name'] or ''}")
+              f"{gpus:<12} {t['name'] or ''}")
+
+
+def gpu_ids_arg(value):
+    try:
+        gpu_ids = [int(part.strip()) for part in value.split(",")
+                   if part.strip()]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "GPU IDs must be comma-separated integers") from exc
+    if not gpu_ids:
+        raise argparse.ArgumentTypeError("at least one GPU ID is required")
+    if any(gpu < 0 for gpu in gpu_ids):
+        raise argparse.ArgumentTypeError("GPU IDs must be non-negative")
+    if len(set(gpu_ids)) != len(gpu_ids):
+        raise argparse.ArgumentTypeError("GPU IDs must be unique")
+    return gpu_ids
+
+
+def gpu_arg_arg(value):
+    delimiter = "=" if "=" in value else ":"
+    gpu_text, found, args = value.partition(delimiter)
+    if not found:
+        raise argparse.ArgumentTypeError(
+            "use GPU=ARGS, for example 0=--data /disk0")
+    try:
+        gpu = int(gpu_text.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("GPU ID must be an integer") from exc
+    if gpu < 0:
+        raise argparse.ArgumentTypeError("GPU ID must be non-negative")
+    return gpu, args.strip()
 
 
 def cmd_ls(a):
@@ -142,6 +199,11 @@ def main():
     s.add_argument("-n", "--name", default="")
     s.add_argument("-p", "--priority", type=int, default=0)
     s.add_argument("-g", "--gpus", type=int, default=1, help="num GPUs")
+    s.add_argument("--gpu-ids", type=gpu_ids_arg, default=None,
+                   help="candidate physical GPUs for one single-GPU run")
+    s.add_argument("--gpu-arg", type=gpu_arg_arg, action="append", default=[],
+                   metavar="GPU=ARGS",
+                   help="args appended only to one GPU's task; repeatable")
     s.add_argument("--min-hbm", type=float, default=None, dest="min_hbm")
     s.set_defaults(fn=cmd_add)
 

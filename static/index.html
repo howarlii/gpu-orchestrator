@@ -316,13 +316,22 @@
         <span class="label">prio</span>
         <input type="number" x-model.number="form.priority">
         <span class="label">#gpu</span>
-        <input type="number" min="1" x-model.number="form.num_gpus">
+        <input type="number" min="1" x-model.number="form.num_gpus"
+          :disabled="form.target_gpu_ids.trim()!==''"
+          title="设置 candidate GPUs 时，该任务固定为单卡运行一次">
+        <span class="label">candidate GPUs</span>
+        <input placeholder="auto / 0,2" x-model="form.target_gpu_ids"
+          style="width:86px" title="从这些物理 GPU 中择一运行；留空则保持原有自动调度">
         <span class="label">min HBM</span>
         <input type="number" min="0" placeholder="def" x-model="form.min_free_hbm_gb" style="width:60px">
       </div>
       <div class="row">
         <textarea placeholder="shell command, e.g.  cd ~/dev/vllm-play && bash lihui/sweep.sh ..."
           x-model="form.command" @keydown.ctrl.enter="addTask()"></textarea>
+      </div>
+      <div class="row" x-show="form.target_gpu_ids.trim()!==''">
+        <textarea placeholder="per-GPU args（可选，每行 GPU=ARGS），调度到哪张卡就追加哪行，例如：&#10;0=--data /disk0&#10;2=--data /disk2"
+          x-model="form.gpu_args" @keydown.ctrl.enter="addTask()"></textarea>
       </div>
       <div class="row">
         <button class="primary" @click="addTask()">+ Enqueue (Ctrl+Enter)</button>
@@ -382,7 +391,7 @@
         <th @click="sortBy('command')">command</th>
         <th @click="sortBy('status')">status</th>
         <th @click="sortBy('priority')">prio</th>
-        <th @click="sortBy('gpu_ids')">gpu</th>
+        <th @click="sortBy('gpu_ids')">gpu/candidates</th>
         <th @click="sortBy('runtime')">runtime</th>
         <th>actions</th>
       </tr></thead>
@@ -397,7 +406,7 @@
               title="拖拽调整运行顺序">⠿</span><span x-text="t.id"></span></td>
             <td class="nm"><div x-text="t.name" :title="t.name"></div></td>
             <td><button class="sm" @click.stop="copyCmd(t)"
-              @mouseenter="showCmdTip($event,t.command)" @mousemove="moveCmdTip($event)"
+              @mouseenter="showCmdTip($event,taskCommandDetail(t))" @mousemove="moveCmdTip($event)"
               @mouseleave="cmdTip=null"
               x-text="copiedId===t.id?'✓ copied':'copy'"></button></td>
             <td>
@@ -420,7 +429,7 @@
               </template>
             </td>
             <td x-text="t.priority"></td>
-            <td x-text="(JSON.parse(t.gpu_ids||'[]')).join(',')"></td>
+            <td x-text="taskGpuText(t)"></td>
             <td x-text="runtime(t)"></td>
             <td>
               <button class="sm" @click.stop="showLog(t)">log</button>
@@ -608,7 +617,8 @@ function app(){
     config:{reserved_gpus:[],max_tasks_per_gpu:1,min_free_hbm_gb:10,
       min_free_ram_gb:0,max_concurrent_tasks:0,dispatch_cooldown_s:0,
       max_gpu_util_pct:0,paused:false},
-    form:{command:'',name:'',priority:0,num_gpus:1,min_free_hbm_gb:'',perLine:false},
+    form:{command:'',name:'',priority:0,num_gpus:1,target_gpu_ids:'',gpu_args:'',
+      min_free_hbm_gb:'',perLine:false},
     selected:[], queueTab:'active', filter:'', statusEdit:null,
     evacFor:null, _procMeta:{},
     occupy:{}, defaultUser:'', occFor:null, occUser:'',
@@ -709,7 +719,7 @@ function app(){
         const gids=(u.gpus&&u.gpus.length)?u.gpus:JSON.parse(t.gpu_ids||'[]');
         out.push({gpu:(gids.length?gids[0]:'-'), pid:u.pid, user:'',
           sm:null, gpu_mem:0, cpu:u.cpu, rss:u.rss,
-          cmd:t.command, pname:t.name, pending:true});
+          cmd:this.taskCommand(t), pname:t.name, pending:true});
       });
       return out.sort((a,b)=>{
         const ga=typeof a.gpu==='number'?a.gpu:99;
@@ -743,24 +753,77 @@ function app(){
     async api(url,method='POST',body=null){
       const r=await fetch(url,{method,headers:{'Content-Type':'application/json'},
         body:body?JSON.stringify(body):null});
-      const d=await r.json(); if(d.tasks)this.tasks=d.tasks;
+      const d=await r.json();
+      if(!r.ok){ alert(d.detail||('request failed: HTTP '+r.status));
+        return {_error:true}; }
+      if(d.tasks)this.tasks=d.tasks;
       if(d.config)this.config=d.config; if(d.occupy)this.occupy=d.occupy;
       return d;
     },
     async addTask(){
       const f=this.form;
       if(!f.command.trim())return;
+      const raw=f.target_gpu_ids.trim();
+      let targets=null;
+      if(raw){
+        const parts=raw.split(/[\s,]+/).filter(Boolean);
+        targets=parts.map(Number);
+        if(targets.some(g=>!Number.isInteger(g)||g<0)
+            || new Set(targets).size!==targets.length){
+          alert('GPU ids 必须是不重复的非负整数，例如 0,2');
+          return;
+        }
+      }
+      const gpuArgs={};
+      const argLines=targets
+        ? f.gpu_args.split('\n').map(s=>s.trim()).filter(Boolean) : [];
+      for(const line of argLines){
+        const match=line.match(/^(\d+)\s*[:=]\s*(.*)$/);
+        if(!match){
+          alert('per-GPU args 每行格式应为 GPU=ARGS，例如 0=--data /disk0');
+          return;
+        }
+        const gpu=Number(match[1]);
+        if(!targets||!targets.includes(gpu)){
+          alert('GPU '+gpu+' 有特化参数，但不在 candidate GPUs 中');
+          return;
+        }
+        if(Object.prototype.hasOwnProperty.call(gpuArgs,gpu)){
+          alert('GPU '+gpu+' 的特化参数重复');
+          return;
+        }
+        gpuArgs[gpu]=match[2];
+      }
       let cmds=[f.command.trim()];
       if(f.perLine){
         cmds=f.command.split('\n').map(s=>s.trim())
              .filter(s=>s && !s.startsWith('#'));
       }
       for(const c of cmds){
-        await this.api('/api/tasks','POST',{command:c,name:f.name,
+        const result=await this.api('/api/tasks','POST',{command:c,name:f.name,
           priority:f.priority||0,num_gpus:f.num_gpus||1,
+          target_gpu_ids:targets,
+          gpu_args:Object.keys(gpuArgs).length?gpuArgs:null,
           min_free_hbm_gb:f.min_free_hbm_gb===''?null:Number(f.min_free_hbm_gb)});
+        if(result._error)return;
       }
       this.form.command='';this.form.name='';
+    },
+    taskGpuText(t){
+      const assigned=JSON.parse(t.gpu_ids||'[]');
+      if(assigned.length)return assigned.join(',');
+      const targets=JSON.parse(t.target_gpu_ids||'[]');
+      return targets.length?'→'+targets.join('|'):'-';
+    },
+    taskCommand(t){ return t.effective_command
+      || [t.command,t.params].filter(Boolean).join(' '); },
+    taskCommandDetail(t){
+      const command=this.taskCommand(t);
+      if(JSON.parse(t.gpu_ids||'[]').length)return command;
+      const args=JSON.parse(t.gpu_args||'{}');
+      const variants=Object.entries(args);
+      return variants.length ? command+'\n\nGPU-specific args:\n'
+        +variants.map(([gpu,value])=>'GPU '+gpu+': '+value).join('\n') : command;
     },
     one(action,id){ this.runAction(action,[id]); },
     bulk(action){ if(this.selected.length)this.runAction(action,[...this.selected]); },
@@ -866,7 +929,7 @@ function app(){
         ta.select(); try{document.execCommand('copy');}catch(__){} ta.remove(); }
     },
     async copyCmd(t){
-      await this.clip(t.command||'');
+      await this.clip(this.taskCommand(t));
       this.copiedId=t.id;
       setTimeout(()=>{ if(this.copiedId===t.id)this.copiedId=null; },1200);
     },
@@ -884,7 +947,7 @@ function app(){
       const q=(this.filter||'').trim().toLowerCase();
       if(!q)return true;
       // every space-separated term must match somewhere (AND)
-      const hay=(String(t.id)+' '+(t.name||'')+' '+(t.command||'')+' '
+      const hay=(String(t.id)+' '+(t.name||'')+' '+this.taskCommandDetail(t)+' '
         +(t.status||'')).toLowerCase();
       return q.split(/\s+/).every(term=>hay.includes(term));
     },
@@ -896,8 +959,9 @@ function app(){
       const k=this.sortKey,d=this.sortDir;
       const val=(t)=>{
         if(k==='runtime')return this._rt(t);
-        if(k==='command'||k==='name'||k==='status')return (t[k]||'').toLowerCase();
-        if(k==='gpu_ids')return t.gpu_ids||'';
+        if(k==='command')return this.taskCommand(t).toLowerCase();
+        if(k==='name'||k==='status')return (t[k]||'').toLowerCase();
+        if(k==='gpu_ids')return t.gpu_ids||t.target_gpu_ids||'';
         return t[k]??0;
       };
       return base.sort((a,b)=>{
