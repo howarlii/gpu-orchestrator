@@ -4,8 +4,10 @@
 ### Features
 - A single-GPU task can declare several candidate physical GPUs and optional per-GPU `GPU=ARGS` suffixes for paired external resources such as GDS/NVMe paths. The scheduler runs the task exactly once on one eligible candidate and appends only that GPU's args. The candidate map persists through requeue and otherwise follows the existing scheduler gates. The Web form and `octl add --gpu-ids 0,2 --gpu-arg '0=...'` expose the feature.
 - Task processes now set `CUDA_DEVICE_ORDER=PCI_BUS_ID`, keeping orchestrator GPU indices aligned with the physical order shown by NVML / `nvidia-smi`.
-- Tasks can declare `estimated_dram_gb` (`est DRAM` in the Web UI, `--dram GB` in `octl`). Normal scheduling, `run now`, and batch force-start keep the task queued whenever its estimate exceeds the host's current available RAM. Candidate/selected GPU information and estimated DRAM are visible directly in the queue table.
-- Hovering anywhere on a queue row shows the complete raw task record, explicitly including the original unmodified command, as well as the derived effective command used after GPU-specific arguments are applied.
+- Tasks can declare `estimated_dram_gb` (`est DRAM` in the Web UI, `--dram GB` in `octl`). Normal scheduling, `run now`, and batch force-start require `MemAvailable >= estimated_dram_gb + min_free_ram_gb`, so the configured free-RAM reserve remains after the task claims its estimate. Candidate/selected GPU information and estimated DRAM are visible directly in the queue table.
+- Queue rows use click/shift-click for selection and double-click for an editable task-settings view. The previous full-record row hover is removed. Name, command, priority, automatic/candidate GPU placement, per-GPU args, estimated DRAM, and the HBM gate can be updated in place; running tasks must be paused first.
+- The active-tab multi-select toolbar can pause all selected running/queued tasks in one action.
+- Multi-select start, pause, requeue, and delete actions now use the same compact icons as row actions. The search field stays collapsed behind a search icon until opened, and the redundant pin-to-top action and API are removed; drag-reordering remains available in `运行顺序` mode.
 - **Expandable host timelines**: clicking the CPU/RAM/DISK bar reveals 10
   minutes of CPU utilization, RAM used/cache/buffers/slab, and physical-disk
   read/write/busy history.
@@ -14,6 +16,10 @@
   GDS, and Phoenix GPU DMA is included in the same total without probe I/O or
   profiling overhead.
 ### Bug Fixes
+- Batch start no longer silently ignores selected paused tasks. It resumes them
+  into the normal queue without force-starting them, while tasks that were
+  already queued enter the forced-launch set. The button is disabled when the
+  selection contains neither state.
 - Disk throughput now sums only whole physical block devices instead of
   double-counting whole disks, partitions, and virtual/LVM layers.
 

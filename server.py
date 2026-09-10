@@ -238,6 +238,20 @@ async def add_task(t: TaskIn):
     return {"id": tid, "tasks": scheduler.list_tasks()}
 
 
+@app.put("/api/tasks/{tid}")
+async def edit_task(tid: int, t: TaskIn):
+    try:
+        updated = scheduler.edit_task(
+            tid, t.command, t.name, t.priority, t.num_gpus,
+            t.min_free_hbm_gb, target_gpu_ids=t.target_gpu_ids,
+            gpu_args=t.gpu_args, estimated_dram_gb=t.estimated_dram_gb)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not updated:
+        raise HTTPException(status_code=404, detail=f"task #{tid} not found")
+    return {"tasks": scheduler.list_tasks()}
+
+
 @app.get("/api/tasks")
 async def list_tasks_api():
     return {"tasks": scheduler.list_tasks()}
@@ -295,15 +309,8 @@ async def run_now(b: RunNowIn):
 
 @app.post("/api/tasks/start")
 async def start_tasks(b: IdsIn):
-    """一键启动: force-launch selected queued tasks, staggered one per tick."""
+    """Force-start queued tasks and resume paused tasks into the normal queue."""
     scheduler.run_now_many(b.ids)
-    return {"tasks": scheduler.list_tasks()}
-
-
-@app.post("/api/tasks/pin")
-async def pin_tasks(b: IdsIn):
-    """置顶: bump selected queued tasks to the top of the queue."""
-    scheduler.pin_tasks(b.ids)
     return {"tasks": scheduler.list_tasks()}
 
 

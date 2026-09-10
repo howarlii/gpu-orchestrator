@@ -266,12 +266,15 @@ class Scheduler:
             return float("inf")
 
     @staticmethod
-    def _dram_block_reason(task: dict, available_gb: float) -> str:
-        estimate = task.get("estimated_dram_gb")
-        if estimate is None or estimate <= available_gb:
+    def _dram_block_reason(task: dict, available_gb: float,
+                           min_free_ram_gb: float = 0.0) -> str:
+        estimate = task.get("estimated_dram_gb") or 0.0
+        required = estimate + min_free_ram_gb
+        if required <= available_gb:
             return ""
-        return (f"task #{task['id']} estimated DRAM {estimate:.1f}G > "
-                f"free RAM {available_gb:.1f}G")
+        return (f"task #{task['id']} needs {required:.1f}G free RAM: "
+                f"estimated DRAM {estimate:.1f}G + min free RAM "
+                f"{min_free_ram_gb:.1f}G > available {available_gb:.1f}G")
 
     def _normalize_gpu_args(
             self, gpu_args: Optional[dict[int, str]],
@@ -372,6 +375,60 @@ class Scheduler:
                                 vals + [tid])
             self.db.commit()
             self._bump()
+
+    def edit_task(self, tid: int, command: str, name: str = "",
+                  priority: int = 0, num_gpus: int = 1,
+                  min_free_hbm_gb: Optional[float] = None,
+                  target_gpu_ids: Optional[list[int]] = None,
+                  gpu_args: Optional[dict[int, str]] = None,
+                  estimated_dram_gb: Optional[float] = None) -> bool:
+        """Update launch settings for a task that is not currently running."""
+        command = command.strip()
+        if not command:
+            raise ValueError("command must not be empty")
+        try:
+            num_gpus = int(num_gpus)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("number of GPUs must be an integer") from exc
+        if num_gpus < 1:
+            raise ValueError("number of GPUs must be at least 1")
+        if min_free_hbm_gb is not None:
+            try:
+                min_free_hbm_gb = float(min_free_hbm_gb)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("minimum free HBM must be a number") from exc
+            if not math.isfinite(min_free_hbm_gb) or min_free_hbm_gb < 0:
+                raise ValueError(
+                    "minimum free HBM must be a finite non-negative number"
+                )
+        targets = (self._normalize_target_gpu_ids(target_gpu_ids)
+                   if target_gpu_ids else [])
+        args = self._normalize_gpu_args(gpu_args, targets)
+        estimated_dram_gb = self._normalize_estimated_dram_gb(
+            estimated_dram_gb)
+        if targets:
+            num_gpus = 1
+
+        with self.lock:
+            task = self.db.execute(
+                "SELECT status FROM tasks WHERE id=?", (tid,)
+            ).fetchone()
+            if task is None:
+                return False
+            if task["status"] == "running":
+                raise ValueError("pause a running task before editing it")
+            self.db.execute(
+                "UPDATE tasks SET name=?, command=?, priority=?, num_gpus=?, "
+                "target_gpu_ids=?, gpu_args=?, min_free_hbm_gb=?, "
+                "estimated_dram_gb=? WHERE id=?",
+                (name.strip() or command[:40], command, int(priority), num_gpus,
+                 json.dumps(targets) if targets else "",
+                 json.dumps(args) if args else "", min_free_hbm_gb,
+                 estimated_dram_gb, tid),
+            )
+            self.db.commit()
+            self._bump()
+        return True
 
     def delete_tasks(self, ids: list[int]) -> None:
         for tid in ids:
@@ -631,12 +688,12 @@ class Scheduler:
         if not row or row["status"] != "queued":
             return False
         task = dict(row)
+        cfg = self.get_config()
         dram_reason = self._dram_block_reason(
-            task, self._available_dram_gb())
+            task, self._available_dram_gb(), cfg["min_free_ram_gb"])
         if dram_reason:
             self._set_state("blocked", dram_reason)
             return False
-        cfg = self.get_config()
         reserved = set(cfg["reserved_gpus"])
         ngpu = self.monitor.count or 0
         targets = self._target_gpu_ids(task)
@@ -649,23 +706,6 @@ class Scheduler:
             cands, key=lambda g: -self._free_hbm_gb(g, sample))[:need]
         self._launch(task, chosen)
         return True
-
-    def pin_tasks(self, ids: list[int]) -> None:
-        """置顶: float selected queued tasks above all others so they dispatch
-        first. No explicit numeric priority — just bump them to the top."""
-        if not ids:
-            return
-        with self.lock:
-            row = self.db.execute(
-                "SELECT MAX(priority) AS m FROM tasks WHERE status='queued'"
-            ).fetchone()
-            top = (row["m"] or 0) + 1
-            for tid in ids:
-                self.db.execute(
-                    "UPDATE tasks SET priority=? WHERE id=? AND status='queued'",
-                    (top, tid))
-            self.db.commit()
-            self._bump()
 
     def reorder_tasks(self, ordered_ids: list[int]) -> None:
         """手动排序: set explicit run order for queued tasks — the first id in
@@ -688,18 +728,30 @@ class Scheduler:
             self._bump()
 
     def run_now_many(self, ids: list[int]) -> None:
-        """一键启动: queue selected tasks for forced launch. They start one per
-        dispatch tick (~2s apart) on the GPU(s) with most free HBM, bypassing
-        the global min-free-RAM gate, dispatch cooldown, pause, HBM gate and
-        per-GPU cap. Per-task DRAM estimates and reserved GPUs are honored."""
+        """Force-start selected queued tasks and resume selected paused tasks.
+
+        Only tasks that were already queued enter the forced-launch set. Paused
+        tasks move to the normal queue and remain subject to every normal gate.
+        Forced tasks bypass dispatch cooldown, pause, HBM gate and per-GPU cap;
+        the combined estimated-DRAM + min-free-RAM gate and reserved GPUs are
+        still honored.
+        """
         if not ids:
             return
         with self.lock:
             rows = self.db.execute(
-                "SELECT id FROM tasks WHERE status='queued' AND id IN (%s)"
+                "SELECT id, status FROM tasks "
+                "WHERE status IN ('queued', 'paused') AND id IN (%s)"
                 % ",".join("?" * len(ids)), ids).fetchall()
             for r in rows:
-                self._force_ids.add(r["id"])
+                if r["status"] == "paused":
+                    self.db.execute(
+                        "UPDATE tasks SET status='queued', gpu_ids='', pid=NULL, "
+                        "started_at=NULL, ended_at=NULL, exit_code=NULL "
+                        "WHERE id=? AND status='paused'", (r["id"],))
+                else:
+                    self._force_ids.add(r["id"])
+            self.db.commit()
             self._bump()
 
     def task_usage(self, sample: dict) -> dict:
@@ -832,7 +884,8 @@ class Scheduler:
                      reserved: set, ngpu: int, util_avg: Optional[dict],
                      ram_avail: float) -> str:
         """Per-GPU breakdown of why the top queued task can't be placed."""
-        dram_reason = self._dram_block_reason(task, ram_avail)
+        dram_reason = self._dram_block_reason(
+            task, ram_avail, cfg["min_free_ram_gb"])
         if dram_reason:
             return dram_reason
         thr = task["min_free_hbm_gb"]
@@ -905,13 +958,14 @@ class Scheduler:
             force_ids = set(self._force_ids)
 
         # ---- forced launches (一键启动): explicit operator override. Ignores
-        #      the global min-free-RAM gate, cooldown, pause, HBM gate, per-GPU
-        #      cap and concurrency limit. Per-task DRAM estimates, one-launch-
-        #      per-tick spacing and reserved-GPU avoidance still apply. -------
+        #      cooldown, pause, HBM gate, per-GPU cap and concurrency limit.
+        #      The combined estimated-DRAM + min-free-RAM gate, one-launch-per-
+        #      tick spacing and reserved-GPU avoidance still apply. -----------
         if force_ids:
             ftask = next((t for t in queued if t["id"] in force_ids), None)
             if ftask:
-                dram_reason = self._dram_block_reason(ftask, ram_avail)
+                dram_reason = self._dram_block_reason(
+                    ftask, ram_avail, min_free_ram)
                 if dram_reason:
                     self._set_state("blocked", dram_reason)
                     return changed
@@ -966,7 +1020,7 @@ class Scheduler:
             return changed
 
         for task in queued:
-            if self._dram_block_reason(task, ram_avail):
+            if self._dram_block_reason(task, ram_avail, min_free_ram):
                 continue
             targets = self._target_gpu_ids(task)
             need = 1 if targets else task["num_gpus"]

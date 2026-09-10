@@ -97,8 +97,6 @@
     border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:11.5px;
     color:var(--fg);white-space:pre-wrap;word-break:break-all;line-height:1.4;
     box-shadow:0 8px 28px rgba(0,0,0,.45);pointer-events:none}
-  .tasktip{max-width:min(900px,86vw);max-height:90vh;overflow:auto;
-    font-family:ui-monospace,SFMono-Regular,Consolas,monospace;word-break:break-word}
   .controls{background:var(--panel);border:1px solid var(--border);border-radius:8px;
     padding:10px;margin:12px 0}
   .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
@@ -108,6 +106,7 @@
   textarea{width:100%;min-height:38px;resize:vertical}
   input[type=number]{width:70px} input[type=checkbox]{accent-color:var(--blue)}
   button{cursor:pointer} button:hover{border-color:var(--blue)}
+  button:disabled{cursor:not-allowed;opacity:.5}
   button.primary{background:#1f6feb;border-color:#1f6feb;color:#fff}
   button.danger{border-color:var(--red);color:var(--red)}
   button.warn{border-color:var(--yellow);color:var(--yellow)}
@@ -136,6 +135,21 @@
     align-items:center;justify-content:center;z-index:50}
   .modal .box{background:var(--panel);border:1px solid var(--border);border-radius:8px;
     width:min(900px,92vw);max-height:82vh;display:flex;flex-direction:column;padding:12px}
+  .modal .box.taskeditbox{width:min(920px,94vw);max-height:90vh;overflow:auto}
+  .editfieldset{border:0;padding:0;margin:10px 0 0;min-width:0}
+  .editgrid{display:grid;grid-template-columns:2fr 1fr 1fr;gap:10px 12px}
+  .editfield{display:flex;flex-direction:column;gap:4px;min-width:0}
+  .editfield.wide{grid-column:1/-1}
+  .editfield>span{color:var(--dim);font-size:11px}
+  .editfield input,.editfield textarea{width:100%}
+  .editfield textarea.command{min-height:96px}
+  .editnote{margin-top:9px;padding:7px 9px;border:1px solid rgba(210,153,34,.45);
+    border-radius:6px;color:var(--yellow);background:rgba(210,153,34,.08)}
+  .editmeta{display:flex;flex-wrap:wrap;gap:5px 18px;margin-top:10px;
+    color:var(--dim);font-size:11px}
+  .editmeta b{color:var(--fg);font-weight:500}
+  @media(max-width:760px){.editgrid{grid-template-columns:1fr 1fr}
+    .editfield.name,.editfield.wide{grid-column:1/-1}}
   pre{background:#010409;border:1px solid var(--border);border-radius:6px;padding:10px;
     overflow:auto;flex:1;white-space:pre-wrap;word-break:break-word;font-size:11.5px}
   .muted{color:var(--dim)} .sp{flex:1}
@@ -317,7 +331,8 @@
       <div class="cfgcard cpu">
         <div class="cfgtitle">CPU</div>
         <div class="cfgbody">
-          <label class="fld" title="只有空闲 RAM 高于此值才继续分配 (0=关闭)">
+          <label class="fld"
+            title="启动条件：当前可用 RAM ≥ 任务 est DRAM + 此保留值（未设置 est DRAM 时按 0 计算）">
             <span>min free RAM (GB)</span>
             <input type="number" min="0" step="1"
               x-model.number="config.min_free_ram_gb" @change="saveConfig()"></label>
@@ -365,7 +380,7 @@
         <span class="label">est DRAM</span>
         <input type="number" min="0" step="1" placeholder="GB"
           x-model="form.estimated_dram_gb" style="width:60px"
-          title="任务预计占用的 DRAM；当前可用 RAM 低于此值时不启动">
+          title="任务预计占用的 DRAM；需要和全局 min free RAM 相加后满足启动门槛">
         <span class="label">min HBM</span>
         <input type="number" min="0" placeholder="def" x-model="form.min_free_hbm_gb" style="width:60px">
       </div>
@@ -393,12 +408,19 @@
         x-text="'running+waiting ('+runningCount()+'/'+waitingCount()+')'"></button>
       <button class="tab" :class="{on:queueTab==='finished'}" @click="switchTab('finished')"
         x-text="'finished ('+tabCount('finished')+')'"></button>
-      <input placeholder="🔍 filter id / name / cmd / status" x-model="filter"
-        @keydown.escape="filter=''" style="width:230px">
-      <button class="sm" x-show="filter" @click="filter=''" title="clear filter">✕</button>
+      <button class="sm" @click="toggleSearch()" aria-label="搜索任务"
+        :style="showSearch?'color:var(--blue);border-color:var(--blue)':''"
+        title="搜索任务">🔍</button>
+      <input x-show="showSearch" x-cloak x-ref="searchInput"
+        placeholder="filter id / name / cmd / status" x-model="filter"
+        @keydown.escape="closeSearch()" style="width:230px">
+      <button class="sm" x-show="showSearch && filter" x-cloak
+        @click="filter='';$nextTick(()=>$refs.searchInput.focus())"
+        aria-label="清空搜索" title="清空搜索">✕</button>
       <button class="sm" @click="toggleSelectAll()"
         x-text="allSelected()?'unselect all':'select all'"></button>
       <span class="label" x-text="selected.length+' selected'"></span>
+      <span class="label">double-click to edit</span>
       <span class="label" x-show="filter" x-text="sortedTasks().length+' match'"></span>
       <button class="sm warn" x-show="queueTab==='finished'" :disabled="!failedCount()"
         @click="retryFailed()"
@@ -412,21 +434,29 @@
         <span class="row" style="gap:6px" x-show="selected.length">
           <button class="sm" style="color:var(--green);border-color:var(--green)"
             @click="startSelected()"
-            title="一键启动选中的排队任务（按调度间隔逐个启动，避免一次性爆 RAM）">▶ start</button>
-          <button class="sm" @click="pinTop()"
-            title="置顶：让选中的排队任务优先调度">📌 pin top</button>
-          <button class="sm warn" @click="bulk('requeue')">requeue</button>
+            :disabled="selectedStartableIds().length===0"
+            aria-label="启动选中的任务"
+            title="queued 任务强制启动；paused 任务只恢复为 queued，随后走正常调度">▶</button>
+          <button class="sm" @click="pauseSelected()"
+            :disabled="selectedPausableIds().length===0"
+            aria-label="暂停选中的任务"
+            :title="'暂停选中的 running / queued 任务；运行中进程会被终止，恢复时从头启动'"
+            >⏸</button>
+          <button class="sm warn" @click="bulk('requeue')"
+            aria-label="重新排队选中的任务" title="重新排队选中的任务">↻</button>
         </span>
       </template>
       <template x-if="queueTab==='finished'">
         <span class="row" style="gap:6px" x-show="selected.length">
           <button class="sm warn" @click="bulk('requeue')"
+            aria-label="重新排队选中的任务"
             title="把选中的已结束任务重新放回队列（重跑）"
-            x-text="'↻ requeue ('+selected.length+')'"></button>
+            >↻</button>
         </span>
       </template>
       <button class="sm danger" x-show="selected.length"
-        @click="bulk('delete')">delete</button>
+        @click="bulk('delete')" aria-label="删除选中的任务"
+        title="删除选中的任务">✕</button>
     </div>
     <table class="tasktable">
       <thead><tr>
@@ -446,9 +476,7 @@
             :draggable="canDrag(t)"
             @dragstart="dragStart(t,$event)" @dragover="dragOver(t,$event)"
             @drop.prevent="drop(t)" @dragend="dragEnd()"
-            @mouseenter="showTaskTip($event,t)" @mousemove="moveTaskTip($event)"
-            @mouseleave="taskTip=null"
-            @click="rowClick(t,$event)">
+            @click="rowClick(t,$event)" @dblclick="rowDoubleClick(t,$event)">
             <td><span class="grip" x-show="canDrag(t)"
               title="拖拽调整运行顺序">⠿</span><span x-text="t.id"></span></td>
             <td class="nm"><div x-text="t.name" :title="t.name"></div></td>
@@ -517,10 +545,82 @@
   <div class="cmdtip" x-show="usageTip" :style="usageTipStyle()"
     x-text="usageTip?usageTip.text:''" style="display:none"></div>
 
-  <!-- Full raw task record when hovering anywhere on a task row -->
-  <div class="cmdtip tasktip" x-show="taskTip && !cmdTip && !usageTip"
-    :style="taskTipStyle()" x-text="taskTip?taskTip.text:''"
-    style="display:none"></div>
+  <!-- Task details / settings modal -->
+  <div class="modal" x-show="editingTask" @click.self="closeTaskEditor()"
+    @keydown.escape.window="editingTask && closeTaskEditor()" style="display:none">
+    <form class="box taskeditbox" @submit.prevent="saveTaskEdit()">
+      <div class="row">
+        <strong x-text="editingTask?('Task #'+editingTask.id+' settings'):''"></strong>
+        <span class="st" :class="editingTaskStatus()" x-text="editingTaskStatus()"></span>
+        <span class="sp"></span>
+        <button type="button" class="sm warn" x-show="editingTaskStatus()==='running'"
+          @click="pauseEditingTask()"
+          title="终止当前进程并停在 paused；之后可以修改任务参数">⏸ pause to edit</button>
+        <button type="button" class="sm" @click="closeTaskEditor()">close</button>
+      </div>
+      <div class="editnote" x-show="editingTaskStatus()==='running'">
+        运行中的进程不能直接换 GPU 或启动参数。先暂停任务，编辑保存后再恢复。
+      </div>
+      <fieldset class="editfieldset" :disabled="editingTaskStatus()==='running'">
+        <div class="editgrid">
+          <label class="editfield name">
+            <span>name</span>
+            <input x-ref="editName" x-model="editForm.name" placeholder="task name">
+          </label>
+          <label class="editfield">
+            <span>priority</span>
+            <input type="number" step="1" x-model.number="editForm.priority">
+          </label>
+          <label class="editfield">
+            <span># GPU</span>
+            <input type="number" min="1" step="1" x-model.number="editForm.num_gpus"
+              :disabled="editForm.target_gpu_ids.trim()!==''"
+              title="设置 candidate GPUs 时固定为单卡运行一次">
+          </label>
+          <label class="editfield wide">
+            <span>command</span>
+            <textarea class="command" x-model="editForm.command"
+              placeholder="shell command"></textarea>
+          </label>
+          <label class="editfield">
+            <span>candidate GPUs</span>
+            <input x-model="editForm.target_gpu_ids" placeholder="auto / 0,2"
+              title="留空为自动调度；填写多个编号表示择一运行">
+          </label>
+          <label class="editfield">
+            <span>est DRAM (GB)</span>
+            <input type="number" min="0" step="1" x-model="editForm.estimated_dram_gb"
+              placeholder="not set"
+              title="需要和全局 min free RAM 相加后满足启动门槛">
+          </label>
+          <label class="editfield">
+            <span>min free HBM (GB)</span>
+            <input type="number" min="0" step="1" x-model="editForm.min_free_hbm_gb"
+              placeholder="default">
+          </label>
+          <label class="editfield wide" x-show="editForm.target_gpu_ids.trim()!==''">
+            <span>per-GPU args（每行 GPU=ARGS）</span>
+            <textarea x-model="editForm.gpu_args"
+              placeholder="0=--data /disk0&#10;2=--data /disk2"></textarea>
+          </label>
+        </div>
+      </fieldset>
+      <div class="editmeta" x-show="editingTask">
+        <span>assigned GPU <b x-text="editingTask?taskGpuText(editingTask):'-'"></b></span>
+        <span>pid <b x-text="editingTask&&editingTask.pid?editingTask.pid:'-'"></b></span>
+        <span>runtime <b x-text="editingTask?runtime(editingTask):'-'"></b></span>
+        <span>log <b x-text="editingTask&&editingTask.log_path?editingTask.log_path:'-'"></b></span>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <span class="label">单击任务行多选，双击进入这里</span>
+        <span class="sp"></span>
+        <button type="button" @click="closeTaskEditor()">cancel</button>
+        <button class="primary" type="submit"
+          :disabled="editSaving || editingTaskStatus()==='running'"
+          x-text="editSaving?'saving…':'save changes'"></button>
+      </div>
+    </form>
+  </div>
 
   <!-- Log modal -->
   <div class="modal" x-show="logTask" @click.self="logTask=null" style="display:none">
@@ -785,12 +885,15 @@ function app(){
       max_gpu_util_pct:0,paused:false},
     form:{command:'',name:'',priority:0,num_gpus:1,target_gpu_ids:'',gpu_args:'',
       estimated_dram_gb:'',min_free_hbm_gb:'',perLine:false},
-    selected:[], queueTab:'active', filter:'', statusEdit:null,
+    selected:[], queueTab:'active', filter:'', showSearch:false, statusEdit:null,
     evacFor:null, _procMeta:{},
     occupy:{}, defaultUser:'', occFor:null, occUser:'',
-    cmdTip:null, usageTip:null, taskTip:null, copiedId:null, anchorId:null,
+    cmdTip:null, usageTip:null, copiedId:null, anchorId:null,
     sortKey:'queue', sortDir:1, dragId:null, dragOverId:null,
     nowTs:Date.now()/1000, clockOffset:0,
+    editingTask:null, editSaving:false,
+    editForm:{command:'',name:'',priority:0,num_gpus:1,target_gpu_ids:'',
+      gpu_args:'',estimated_dram_gb:'',min_free_hbm_gb:''},
     logTask:null, logText:'', logFollow:true, logCopied:false, _logTimer:null,
     logRuns:[], logRun:null, logPath:'',
     _pidmap:{},
@@ -943,7 +1046,21 @@ function app(){
     async addTask(){
       const f=this.form;
       if(!f.command.trim())return;
-      const raw=f.target_gpu_ids.trim();
+      const settings=this.taskSettingsPayload(f);
+      if(!settings)return;
+      let cmds=[f.command.trim()];
+      if(f.perLine){
+        cmds=f.command.split('\n').map(s=>s.trim())
+             .filter(s=>s && !s.startsWith('#'));
+      }
+      for(const c of cmds){
+        const result=await this.api('/api/tasks','POST',{command:c,...settings});
+        if(result._error)return;
+      }
+      this.form.command='';this.form.name='';
+    },
+    parseGpuSettings(f){
+      const raw=String(f.target_gpu_ids||'').trim();
       let targets=null;
       if(raw){
         const parts=raw.split(/[\s,]+/).filter(Boolean);
@@ -951,7 +1068,7 @@ function app(){
         if(targets.some(g=>!Number.isInteger(g)||g<0)
             || new Set(targets).size!==targets.length){
           alert('GPU ids 必须是不重复的非负整数，例如 0,2');
-          return;
+          return null;
         }
       }
       const gpuArgs={};
@@ -961,35 +1078,50 @@ function app(){
         const match=line.match(/^(\d+)\s*[:=]\s*(.*)$/);
         if(!match){
           alert('per-GPU args 每行格式应为 GPU=ARGS，例如 0=--data /disk0');
-          return;
+          return null;
         }
         const gpu=Number(match[1]);
         if(!targets||!targets.includes(gpu)){
           alert('GPU '+gpu+' 有特化参数，但不在 candidate GPUs 中');
-          return;
+          return null;
         }
         if(Object.prototype.hasOwnProperty.call(gpuArgs,gpu)){
           alert('GPU '+gpu+' 的特化参数重复');
-          return;
+          return null;
         }
         gpuArgs[gpu]=match[2];
       }
-      let cmds=[f.command.trim()];
-      if(f.perLine){
-        cmds=f.command.split('\n').map(s=>s.trim())
-             .filter(s=>s && !s.startsWith('#'));
+      return {targets,gpuArgs};
+    },
+    optionalNonnegative(value,label){
+      if(value===''||value==null)return {value:null};
+      const parsed=Number(value);
+      if(!Number.isFinite(parsed)||parsed<0){
+        alert(label+' 必须是非负数');
+        return null;
       }
-      for(const c of cmds){
-        const result=await this.api('/api/tasks','POST',{command:c,name:f.name,
-          priority:f.priority||0,num_gpus:f.num_gpus||1,
-          target_gpu_ids:targets,
-          gpu_args:Object.keys(gpuArgs).length?gpuArgs:null,
-          estimated_dram_gb:f.estimated_dram_gb===''
-            ?null:Number(f.estimated_dram_gb),
-          min_free_hbm_gb:f.min_free_hbm_gb===''?null:Number(f.min_free_hbm_gb)});
-        if(result._error)return;
+      return {value:parsed};
+    },
+    taskSettingsPayload(f){
+      const gpu=this.parseGpuSettings(f);
+      if(!gpu)return null;
+      const dram=this.optionalNonnegative(f.estimated_dram_gb,'est DRAM');
+      const hbm=this.optionalNonnegative(f.min_free_hbm_gb,'min free HBM');
+      if(!dram||!hbm)return null;
+      const numGpus=Number(f.num_gpus);
+      const priority=Number(f.priority);
+      if(!Number.isInteger(numGpus)||numGpus<1){
+        alert('# GPU 必须是大于等于 1 的整数');
+        return null;
       }
-      this.form.command='';this.form.name='';
+      if(!Number.isInteger(priority)){
+        alert('priority 必须是整数');
+        return null;
+      }
+      return {name:f.name||'',priority,num_gpus:numGpus,
+        target_gpu_ids:gpu.targets,
+        gpu_args:Object.keys(gpu.gpuArgs).length?gpu.gpuArgs:null,
+        estimated_dram_gb:dram.value,min_free_hbm_gb:hbm.value};
     },
     taskGpuText(t){
       const assigned=JSON.parse(t.gpu_ids||'[]');
@@ -1014,25 +1146,6 @@ function app(){
       return variants.length ? command+'\n\nGPU-specific args:\n'
         +variants.map(([gpu,value])=>'GPU '+gpu+': '+value).join('\n') : command;
     },
-    taskRawText(t){
-      const raw={...t}; delete raw.effective_command;
-      const fields=Object.entries(raw).filter(([key])=>key!=='command')
-        .map(([key,value])=>key+': '+(value==null?'null':String(value)));
-      return 'TASK #'+t.id+' RAW INFO\n\ncommand (raw):\n'+(t.command??'')
-        +'\n\nall other raw fields:\n'+fields.join('\n')
-        +'\n\neffective command:\n'+this.taskCommand(t);
-    },
-    showTaskTip(e,t){ this.taskTip={text:this.taskRawText(t),x:e.clientX,y:e.clientY}; },
-    moveTaskTip(e){ if(this.taskTip){ this.taskTip.x=e.clientX;this.taskTip.y=e.clientY; } },
-    taskTipStyle(){
-      if(!this.taskTip)return '';
-      const right=this.taskTip.x>window.innerWidth*.55;
-      const bottom=this.taskTip.y>window.innerHeight*.45;
-      return (right?'right:'+(window.innerWidth-this.taskTip.x+14)+'px;'
-        :'left:'+(this.taskTip.x+14)+'px;')
-        +(bottom?'bottom:'+(window.innerHeight-this.taskTip.y+14)+'px;'
-          :'top:'+(this.taskTip.y+14)+'px;');
-    },
     one(action,id){ this.runAction(action,[id]); },
     bulk(action){ if(this.selected.length)this.runAction(action,[...this.selected]); },
     async runAction(action,ids){
@@ -1044,10 +1157,16 @@ function app(){
       else if(action==='run_now'){ await this.api('/api/tasks/run_now','POST',{id:ids[0]}); }
       this.selected=this.selected.filter(x=>!ids.includes(x));
     },
-    async startSelected(){ const ids=[...this.selected]; if(!ids.length)return;
+    selectedStartableIds(){ const selected=new Set(this.selected);
+      return this.tasks.filter(t=>selected.has(t.id)
+        && (t.status==='queued'||t.status==='paused')).map(t=>t.id); },
+    async startSelected(){ const ids=this.selectedStartableIds(); if(!ids.length)return;
       await this.api('/api/tasks/start','POST',{ids}); },
-    async pinTop(){ const ids=[...this.selected]; if(!ids.length)return;
-      await this.api('/api/tasks/pin','POST',{ids}); },
+    selectedPausableIds(){ const selected=new Set(this.selected);
+      return this.tasks.filter(t=>selected.has(t.id)
+        && (t.status==='running'||t.status==='queued')).map(t=>t.id); },
+    async pauseSelected(){ const ids=this.selectedPausableIds();
+      if(ids.length)await this.runAction('pause',ids); },
     dispatchClass(){ const s=(this.dispatch&&this.dispatch.state)||'';
       return ({dispatching:'running',idle:'done',paused:'killed',
         cooldown:'killed',blocked:'failed'})[s]||'queued'; },
@@ -1060,6 +1179,7 @@ function app(){
       await this.api('/api/tasks/set_status','POST',{ids:[t.id],status}); },
     // row selection: click toggles, shift-click selects a contiguous range
     rowClick(t,e){
+      if(e.detail>1)return;
       const list=this.sortedTasks();
       if(e.shiftKey && this.anchorId!=null){
         const a=list.findIndex(x=>x.id===this.anchorId);
@@ -1077,10 +1197,61 @@ function app(){
         : [...this.selected,t.id];
       this.anchorId=t.id;
     },
+    rowDoubleClick(t,e){
+      if(e.target.closest('button,input,textarea,select,a'))return;
+      this.openTaskEditor(t);
+    },
+    openTaskEditor(t){
+      if(!this.selected.includes(t.id))this.selected=[...this.selected,t.id];
+      this.cmdTip=null;this.usageTip=null;
+      const targets=JSON.parse(t.target_gpu_ids||'[]');
+      const args=JSON.parse(t.gpu_args||'{}');
+      this.editingTask=t;
+      this.editForm={command:t.command||'',name:t.name||'',priority:t.priority||0,
+        num_gpus:t.num_gpus||1,target_gpu_ids:targets.join(','),
+        gpu_args:targets.filter(g=>Object.prototype.hasOwnProperty.call(args,g))
+          .map(g=>g+'='+args[g]).join('\n'),
+        estimated_dram_gb:t.estimated_dram_gb==null?'':t.estimated_dram_gb,
+        min_free_hbm_gb:t.min_free_hbm_gb==null?'':t.min_free_hbm_gb};
+      this.$nextTick(()=>{ if(this.editingTaskStatus()!=='running')this.$refs.editName?.focus(); });
+    },
+    editingTaskStatus(){
+      if(!this.editingTask)return '';
+      const current=this.tasks.find(t=>t.id===this.editingTask.id);
+      return current?current.status:this.editingTask.status;
+    },
+    closeTaskEditor(){ this.editingTask=null;this.editSaving=false; },
+    async pauseEditingTask(){
+      if(!this.editingTask||this.editingTaskStatus()!=='running')return;
+      const result=await this.api('/api/tasks/pause','POST',{ids:[this.editingTask.id]});
+      if(!result._error){
+        this.editingTask=this.tasks.find(t=>t.id===this.editingTask.id)||this.editingTask;
+        this.$nextTick(()=>this.$refs.editName?.focus());
+      }
+    },
+    async saveTaskEdit(){
+      if(!this.editingTask||this.editingTaskStatus()==='running')return;
+      const command=this.editForm.command.trim();
+      if(!command){ alert('command 不能为空');return; }
+      const settings=this.taskSettingsPayload(this.editForm);
+      if(!settings)return;
+      this.editSaving=true;
+      try{
+        const result=await this.api('/api/tasks/'+this.editingTask.id,'PUT',
+          {command,...settings});
+        if(!result._error)this.closeTaskEditor();
+      } finally { this.editSaving=false; }
+    },
     allSelected(){ const v=this.sortedTasks();
       return v.length>0 && v.every(t=>this.selected.includes(t.id)); },
     toggleSelectAll(){ this.selected=this.allSelected()
       ? [] : this.sortedTasks().map(t=>t.id); },
+    toggleSearch(){
+      if(this.showSearch){ this.closeSearch();return; }
+      this.showSearch=true;
+      this.$nextTick(()=>this.$refs.searchInput?.focus());
+    },
+    closeSearch(){ this.filter='';this.showSearch=false; },
 
     // config
     async saveConfig(){ await this.api('/api/config','POST',{
