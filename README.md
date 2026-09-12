@@ -43,10 +43,12 @@ Open `http://localhost:8800`. If on a remote box, forward the port:
   reads kernel block counters only, so local filesystem I/O includes buffered,
   direct-I/O, and GPU-direct DMA paths such as Phoenix in one total.
 - Queue: click/shift-click to multi-select, batch pause/delete/requeue, and
-  double-click a row to open its task settings. The settings view can edit the
-  command, status, priority, GPU placement and resource gates such as estimated
-  DRAM. Editable statuses are queued, paused and the terminal states; running is
-  process-backed and cannot be assigned manually.
+  select exactly one task to reveal the edit icon at the right of the queue
+  toolbar. The settings view can edit the command, status, priority, GPU
+  placement and resource gates such as estimated DRAM. Selecting multiple tasks
+  replaces the edit icon with the batch controls. Editable statuses are queued,
+  paused and the terminal states; running is process-backed and cannot be
+  assigned manually.
   Batch actions use the same compact icons as row actions. Search stays collapsed
   behind its icon until opened. Click column headers to sort; `运行顺序` restores
   scheduler order and enables queue drag-reordering. The live log viewer supports
@@ -56,7 +58,7 @@ Open `http://localhost:8800`. If on a remote box, forward the port:
 - Scheduler bar: edit `max_tasks_per_gpu`, `min_free_hbm_gb`, pause dispatch —
   all applied live.
 - Candidate GPU/resource binding: fill `candidate GPUs` with values such as `0,2`; the task remains one single-GPU run and the scheduler chooses one available candidate. The command and common args are shared. In `per-GPU args`, optionally map each GPU to the external-resource args that must accompany it, one `GPU=ARGS` per line. For example, GPU 0 can append the path for its paired NVMe while GPU 2 appends a different path. A queued choice is shown as `→0|2`; after launch, `0 ← 0|2` shows both the selected GPU and original candidates. External-resource concurrency follows the existing scheduler settings such as `max_tasks_per_gpu`; the mapping itself adds no extra lock.
-- The new-task form and queue table both show candidate/selected GPU information and estimated DRAM. Hover the GPU cell to inspect its per-GPU argument mapping. Task rows no longer open a full-record hover card; select with one click and open the editable settings view with a double-click.
+- The new-task form and queue table both show candidate/selected GPU information and estimated DRAM. Hover the GPU cell to inspect its per-GPU argument mapping. Task rows no longer open a full-record hover card; select one task and use the queue-toolbar edit icon to open its settings.
 
 The CLI exposes the same setting:
 

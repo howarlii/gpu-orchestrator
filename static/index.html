@@ -420,7 +420,6 @@
       <button class="sm" @click="toggleSelectAll()"
         x-text="allSelected()?'unselect all':'select all'"></button>
       <span class="label" x-text="selected.length+' selected'"></span>
-      <span class="label">double-click to edit</span>
       <span class="label" x-show="filter" x-text="sortedTasks().length+' match'"></span>
       <button class="sm warn" x-show="queueTab==='finished'" :disabled="!failedCount()"
         @click="retryFailed()"
@@ -430,8 +429,11 @@
         @click="sortKey='queue'"
         title="按实际运行顺序排列；此模式下可拖拽排队任务调整优先级">≡ 运行顺序</button>
       <span class="sp"></span>
+      <button class="sm" x-show="selected.length===1" x-cloak
+        @click="editSelectedTask()" aria-label="修改选中任务的设置"
+        title="修改选中任务的设置">✎</button>
       <template x-if="queueTab==='active'">
-        <span class="row" style="gap:6px" x-show="selected.length">
+        <span class="row" style="gap:6px" x-show="selected.length>1">
           <button class="sm" style="color:var(--green);border-color:var(--green)"
             @click="startSelected()"
             :disabled="selectedStartableIds().length===0"
@@ -447,14 +449,14 @@
         </span>
       </template>
       <template x-if="queueTab==='finished'">
-        <span class="row" style="gap:6px" x-show="selected.length">
+        <span class="row" style="gap:6px" x-show="selected.length>1">
           <button class="sm warn" @click="bulk('requeue')"
             aria-label="重新排队选中的任务"
             title="把选中的已结束任务重新放回队列（重跑）"
             >↻</button>
         </span>
       </template>
-      <button class="sm danger" x-show="selected.length"
+      <button class="sm danger" x-show="selected.length>1"
         @click="bulk('delete')" aria-label="删除选中的任务"
         title="删除选中的任务">✕</button>
     </div>
@@ -476,7 +478,7 @@
             :draggable="canDrag(t)"
             @dragstart="dragStart(t,$event)" @dragover="dragOver(t,$event)"
             @drop.prevent="drop(t)" @dragend="dragEnd()"
-            @click="rowClick(t,$event)" @dblclick="rowDoubleClick(t,$event)">
+            @click="rowClick(t,$event)">
             <td><span class="grip" x-show="canDrag(t)"
               title="拖拽调整运行顺序">⠿</span><span x-text="t.id"></span></td>
             <td class="nm"><div x-text="t.name" :title="t.name"></div></td>
@@ -624,7 +626,7 @@
         <span>log <b x-text="editingTask&&editingTask.log_path?editingTask.log_path:'-'"></b></span>
       </div>
       <div class="row" style="margin-top:12px">
-        <span class="label">单击任务行多选，双击进入这里</span>
+        <span class="label">左键单击任务行选择；单选后使用队列右上角的编辑按钮</span>
         <span class="sp"></span>
         <button type="button" @click="closeTaskEditor()">cancel</button>
         <button class="primary" type="submit"
@@ -1209,10 +1211,9 @@ function app(){
         : [...this.selected,t.id];
       this.anchorId=t.id;
     },
-    rowDoubleClick(t,e){
-      if(e.target.closest('button,input,textarea,select,a'))return;
-      this.openTaskEditor(t);
-    },
+    selectedTask(){ if(this.selected.length!==1)return null;
+      return this.tasks.find(t=>t.id===this.selected[0])||null; },
+    editSelectedTask(){ const t=this.selectedTask(); if(t)this.openTaskEditor(t); },
     openTaskEditor(t){
       if(!this.selected.includes(t.id))this.selected=[...this.selected,t.id];
       this.cmdTip=null;this.usageTip=null;
