@@ -44,7 +44,9 @@ Open `http://localhost:8800`. If on a remote box, forward the port:
   direct-I/O, and GPU-direct DMA paths such as Phoenix in one total.
 - Queue: click/shift-click to multi-select, batch pause/delete/requeue, and
   double-click a row to open its task settings. The settings view can edit the
-  command, priority, GPU placement and resource gates such as estimated DRAM.
+  command, status, priority, GPU placement and resource gates such as estimated
+  DRAM. Editable statuses are queued, paused and the terminal states; running is
+  process-backed and cannot be assigned manually.
   Batch actions use the same compact icons as row actions. Search stays collapsed
   behind its icon until opened. Click column headers to sort; `运行顺序` restores
   scheduler order and enables queue drag-reordering. The live log viewer supports

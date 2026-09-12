@@ -182,6 +182,10 @@ class TaskIn(BaseModel):
     estimated_dram_gb: float | None = None
 
 
+class TaskEditIn(TaskIn):
+    status: str | None = None
+
+
 class IdsIn(BaseModel):
     ids: list[int]
 
@@ -239,12 +243,13 @@ async def add_task(t: TaskIn):
 
 
 @app.put("/api/tasks/{tid}")
-async def edit_task(tid: int, t: TaskIn):
+async def edit_task(tid: int, t: TaskEditIn):
     try:
         updated = scheduler.edit_task(
             tid, t.command, t.name, t.priority, t.num_gpus,
             t.min_free_hbm_gb, target_gpu_ids=t.target_gpu_ids,
-            gpu_args=t.gpu_args, estimated_dram_gb=t.estimated_dram_gb)
+            gpu_args=t.gpu_args, estimated_dram_gb=t.estimated_dram_gb,
+            status=t.status)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not updated:

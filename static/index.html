@@ -568,6 +568,18 @@
             <input x-ref="editName" x-model="editForm.name" placeholder="task name">
           </label>
           <label class="editfield">
+            <span>status</span>
+            <select x-model="editForm.status">
+              <option value="queued">queued</option>
+              <option value="paused">paused</option>
+              <option value="done">done</option>
+              <option value="failed">failed</option>
+              <option value="killed">killed</option>
+              <option value="lost">lost</option>
+              <option value="running" disabled>running</option>
+            </select>
+          </label>
+          <label class="editfield">
             <span>priority</span>
             <input type="number" step="1" x-model.number="editForm.priority">
           </label>
@@ -892,7 +904,7 @@ function app(){
     sortKey:'queue', sortDir:1, dragId:null, dragOverId:null,
     nowTs:Date.now()/1000, clockOffset:0,
     editingTask:null, editSaving:false,
-    editForm:{command:'',name:'',priority:0,num_gpus:1,target_gpu_ids:'',
+    editForm:{command:'',name:'',status:'queued',priority:0,num_gpus:1,target_gpu_ids:'',
       gpu_args:'',estimated_dram_gb:'',min_free_hbm_gb:''},
     logTask:null, logText:'', logFollow:true, logCopied:false, _logTimer:null,
     logRuns:[], logRun:null, logPath:'',
@@ -1207,7 +1219,8 @@ function app(){
       const targets=JSON.parse(t.target_gpu_ids||'[]');
       const args=JSON.parse(t.gpu_args||'{}');
       this.editingTask=t;
-      this.editForm={command:t.command||'',name:t.name||'',priority:t.priority||0,
+      this.editForm={command:t.command||'',name:t.name||'',status:t.status,
+        priority:t.priority||0,
         num_gpus:t.num_gpus||1,target_gpu_ids:targets.join(','),
         gpu_args:targets.filter(g=>Object.prototype.hasOwnProperty.call(args,g))
           .map(g=>g+'='+args[g]).join('\n'),
@@ -1226,6 +1239,7 @@ function app(){
       const result=await this.api('/api/tasks/pause','POST',{ids:[this.editingTask.id]});
       if(!result._error){
         this.editingTask=this.tasks.find(t=>t.id===this.editingTask.id)||this.editingTask;
+        this.editForm.status='paused';
         this.$nextTick(()=>this.$refs.editName?.focus());
       }
     },
@@ -1238,7 +1252,7 @@ function app(){
       this.editSaving=true;
       try{
         const result=await this.api('/api/tasks/'+this.editingTask.id,'PUT',
-          {command,...settings});
+          {command,status:this.editForm.status,...settings});
         if(!result._error)this.closeTaskEditor();
       } finally { this.editSaving=false; }
     },

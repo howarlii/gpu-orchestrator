@@ -247,6 +247,7 @@ class GpuAffinityTest(unittest.TestCase):
             target_gpu_ids=[3, 1],
             gpu_args={3: "--disk three", 1: "--disk one"},
             estimated_dram_gb=96.5,
+            status="paused",
         )
 
         self.assertTrue(updated)
@@ -262,6 +263,7 @@ class GpuAffinityTest(unittest.TestCase):
         )
         self.assertEqual(task["min_free_hbm_gb"], 18)
         self.assertEqual(task["estimated_dram_gb"], 96.5)
+        self.assertEqual(task["status"], "paused")
 
     def test_edit_task_can_restore_automatic_gpu_placement(self):
         tid = self.scheduler.add_task(
@@ -296,6 +298,60 @@ class GpuAffinityTest(unittest.TestCase):
         self.assertEqual(task["command"], "old")
         self.assertEqual(json.loads(task["target_gpu_ids"]), [0])
         self.assertEqual(task["estimated_dram_gb"], 32)
+
+    def test_pause_waits_thirty_seconds_before_sigkill(self):
+        tid = self.scheduler.add_task("run")
+        proc = mock.Mock(pid=4321)
+        proc.poll.return_value = None
+        self.scheduler.procs[tid] = proc
+        self.scheduler.db.execute(
+            "UPDATE tasks SET status='running', pid=? WHERE id=?", (proc.pid, tid)
+        )
+        self.scheduler.db.commit()
+
+        with (
+            mock.patch.object(scheduler.os, "getpgid", return_value=4321),
+            mock.patch.object(scheduler.os, "killpg") as killpg,
+            mock.patch.object(scheduler.time, "sleep") as sleep,
+        ):
+            self.scheduler.pause_tasks([tid])
+
+        self.assertEqual(sleep.call_count, 300)
+        sleep.assert_called_with(0.1)
+        self.assertEqual(
+            killpg.call_args_list,
+            [
+                mock.call(4321, scheduler.signal.SIGTERM),
+                mock.call(4321, scheduler.signal.SIGKILL),
+            ],
+        )
+        self.assertEqual(self.scheduler.list_tasks()[0]["status"], "paused")
+
+    def test_edit_task_status_change_clears_forced_launch_state(self):
+        tid = self.scheduler.add_task("run")
+        self.scheduler.run_now_many([tid])
+        self.assertIn(tid, self.scheduler._force_ids)
+
+        self.scheduler.edit_task(tid, "run", status="failed")
+
+        task = self.scheduler.list_tasks()[0]
+        self.assertEqual(task["status"], "failed")
+        self.assertIsNotNone(task["ended_at"])
+        self.assertNotIn(tid, self.scheduler._force_ids)
+
+        self.scheduler.edit_task(tid, "run", status="queued")
+
+        task = self.scheduler.list_tasks()[0]
+        self.assertEqual(task["status"], "queued")
+        self.assertIsNone(task["ended_at"])
+
+    def test_edit_task_rejects_manual_running_status(self):
+        tid = self.scheduler.add_task("run")
+
+        with self.assertRaisesRegex(ValueError, "status must be"):
+            self.scheduler.edit_task(tid, "run", status="running")
+
+        self.assertEqual(self.scheduler.list_tasks()[0]["status"], "queued")
 
 
 if __name__ == "__main__":

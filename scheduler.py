@@ -33,6 +33,8 @@ LOG_DIR.mkdir(exist_ok=True)
 OCCUPY_WORKER = ROOT / "occupy_worker.py"
 # template for the placeholder process' command line, shown in nvidia-smi
 OCCUPY_MSG = "Please reserve this GPU for {user}"
+TASK_TERMINATION_GRACE_SECONDS = 30
+TASK_TERMINATION_POLL_SECONDS = 0.1
 
 ACTIVE = ("queued", "running")
 
@@ -381,7 +383,8 @@ class Scheduler:
                   min_free_hbm_gb: Optional[float] = None,
                   target_gpu_ids: Optional[list[int]] = None,
                   gpu_args: Optional[dict[int, str]] = None,
-                  estimated_dram_gb: Optional[float] = None) -> bool:
+                  estimated_dram_gb: Optional[float] = None,
+                  status: Optional[str] = None) -> bool:
         """Update launch settings for a task that is not currently running."""
         command = command.strip()
         if not command:
@@ -406,6 +409,12 @@ class Scheduler:
         args = self._normalize_gpu_args(gpu_args, targets)
         estimated_dram_gb = self._normalize_estimated_dram_gb(
             estimated_dram_gb)
+        editable_statuses = {"queued", "paused", "done", "failed", "killed",
+                             "lost"}
+        if status is not None and status not in editable_statuses:
+            raise ValueError(
+                "status must be queued, paused, done, failed, killed, or lost"
+            )
         if targets:
             num_gpus = 1
 
@@ -426,6 +435,22 @@ class Scheduler:
                  json.dumps(args) if args else "", min_free_hbm_gb,
                  estimated_dram_gb, tid),
             )
+            if status is not None and status != task["status"]:
+                self._force_ids.discard(tid)
+                if status == "queued":
+                    self.db.execute(
+                        "UPDATE tasks SET status='queued', gpu_ids='', pid=NULL, "
+                        "started_at=NULL, ended_at=NULL, exit_code=NULL "
+                        "WHERE id=?", (tid,))
+                elif status == "paused":
+                    self.db.execute(
+                        "UPDATE tasks SET status='paused', gpu_ids='', pid=NULL "
+                        "WHERE id=?", (tid,))
+                else:
+                    self.db.execute(
+                        "UPDATE tasks SET status=?, gpu_ids='', pid=NULL, "
+                        "ended_at=COALESCE(ended_at, ?) WHERE id=?",
+                        (status, _now(), tid))
             self.db.commit()
             self._bump()
         return True
@@ -509,19 +534,33 @@ class Scheduler:
             orphan_pid = self.orphans.pop(tid, None)
         # re-adopted task: kill its process group directly by PID
         if orphan_pid and self._pid_alive(orphan_pid, None):
+            orphan_pgid = None
             try:
-                os.killpg(os.getpgid(orphan_pid), signal.SIGTERM)
+                orphan_pgid = os.getpgid(orphan_pid)
+                os.killpg(orphan_pgid, signal.SIGTERM)
             except Exception:
                 pass
+            if orphan_pgid is not None:
+                for _ in range(int(TASK_TERMINATION_GRACE_SECONDS /
+                                   TASK_TERMINATION_POLL_SECONDS)):
+                    if not self._pid_alive(orphan_pid, None):
+                        break
+                    time.sleep(TASK_TERMINATION_POLL_SECONDS)
+                if self._pid_alive(orphan_pid, None):
+                    try:
+                        os.killpg(orphan_pgid, signal.SIGKILL)
+                    except Exception:
+                        pass
         if proc and proc.poll() is None:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
             except Exception:
                 pass
-            for _ in range(20):
+            for _ in range(int(TASK_TERMINATION_GRACE_SECONDS /
+                               TASK_TERMINATION_POLL_SECONDS)):
                 if proc.poll() is not None:
                     break
-                time.sleep(0.1)
+                time.sleep(TASK_TERMINATION_POLL_SECONDS)
             if proc.poll() is None:
                 try:
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
